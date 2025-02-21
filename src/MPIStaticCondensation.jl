@@ -44,7 +44,7 @@ using LinearAlgebra
 import LinearAlgebra: ldiv!
 using SparseArrays
 
-struct CondensedFactorization{T, M<:AbstractMatrix{T}} <: Factorization{T}
+struct CondensedFactorization{T, M<:AbstractMatrix{T}, F} <: Factorization{T}
   A::M
   indices::Vector{UnitRange{Int}}
   nlocalblocks::Int
@@ -53,6 +53,7 @@ struct CondensedFactorization{T, M<:AbstractMatrix{T}} <: Factorization{T}
   reducedcoupledindices::Vector{UnitRange{Int}}
   localblocksizes::Vector{Int}
   couplingblocksizes::Vector{Int}
+  localfactors::Dict{Int,F}
 end
 
 function CondensedFactorization(A::AbstractMatrix{T}, localblocksize::Integer, couplingblocksize::Integer) where T
@@ -92,7 +93,8 @@ function CondensedFactorization(A::AbstractMatrix{T}, localblocksizes::Vector{<:
     inds = (indices[i] .- indices[i][1] .+ 1) .+ reducedcoupledindices[c][end]
     push!(reducedcoupledindices, inds) 
   end
-  return CondensedFactorization(A, indices, nlocalblocks, ncouplingblocks, reducedlocalindices, reducedcoupledindices, localblocksizes, couplingblocksizes)
+  localfactors = factoriselocals(indices, A)
+  return CondensedFactorization(A, indices, nlocalblocks, ncouplingblocks, reducedlocalindices, reducedcoupledindices, localblocksizes, couplingblocksizes, localfactors)
 end
 Base.size(A::CondensedFactorization) = (size(A.A, 1), size(A.A, 2))
 Base.size(A::CondensedFactorization, i) = size(A.A, i)
@@ -101,18 +103,18 @@ iscouplingblock(i) = !islocalblock(i)
 localindices(A::CondensedFactorization) = A.indices[1:2:end]
 couplingindices(A::CondensedFactorization) = A.indices[2:2:end-1]
 
-function factoriselocals(A::CondensedFactorization{T}) where T
-  lis = A.indices
-  localfact = lu(A.A[lis[1], lis[1]])
+function factoriselocals(lis, A)
+  localfact = lu(A[lis[1], lis[1]])
   d = Dict{Int, typeof(localfact)}(1=>localfact)
   for (i, li) in enumerate(lis) # parallelisable
     iscouplingblock(i) && continue
-    d[i] = lu(A.A[li, li])
+    d[i] = lu(A[li, li])
   end
   return d
 end
 
-function calculatecouplings(A::CondensedFactorization{T,M}, localfactors) where {T,M}
+function calculatecouplings(A::CondensedFactorization{T,M,F}) where {T,M,F}
+  localfactors = A.localfactors
   d = Dict{Tuple{Int, Int}, M}()
   for (i, li) in enumerate(A.indices) # parallelisable
     islocalblock(i) && continue
@@ -128,7 +130,8 @@ function calculatecouplings(A::CondensedFactorization{T,M}, localfactors) where 
   return d
 end
 
-function solvelocalparts(A::CondensedFactorization{T,M}, b, localfactors) where {T,M}
+function solvelocalparts(A::CondensedFactorization{T,M,F}, b) where {T,M,F}
+  localfactors = A.localfactors
   d = Dict{Int, M}()
   for (i, li) in enumerate(A.indices) # parallelisable
     iscouplingblock(i) && continue
@@ -232,9 +235,8 @@ function static_condensed_solve(A::CondensedFactorization, b)
 end
 
 function ldiv!(x::AbstractVector, A::CondensedFactorization, b::AbstractVector)
-  localfactors = factoriselocals(A)
-  localsolutions = solvelocalparts(A, b, localfactors)
-  couplings = calculatecouplings(A, localfactors)
+  localsolutions = solvelocalparts(A, b)
+  couplings = calculatecouplings(A)
   xc = coupledx(A, b, localsolutions, couplings)
   xl = localx(A, xc, b, localsolutions, couplings)
   @. x = xl + xc
