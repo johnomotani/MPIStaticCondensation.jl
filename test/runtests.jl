@@ -9,10 +9,11 @@ function ldiv_wrapper(A, b)
 end
 
 @testset "CondensedFactorization" begin
-  @testset "$label" for (label, solvefunc) in (
+  @testset "$label sparse=$sparse" for (label, solvefunc) in (
                                                ("static_condensed_solve", static_condensed_solve),
                                                ("ldiv!", ldiv_wrapper),
-                                              )
+                                              ),
+                                       sparse in (false, true)
     @testset "($L,$C)" for (L, C, tol) in (
                                            (2, 1, 1.0e-14),
                                            (3, 2, 1.0e-14),
@@ -36,7 +37,7 @@ end
            zLL t32 A33]
       b = rand(rng, size(A, 1))
       check = A \ b
-      Acf = CondensedFactorization(A, L, C)
+      Acf = CondensedFactorization(A, L, C; sparse_local_blocks=sparse)
       x = solvefunc(Acf, b)
       @test isapprox(A * x, b; atol=tol)
       @test isapprox(A * check, b; atol=tol)
@@ -49,7 +50,7 @@ end
            zLL zLC zLL t54 A55]
       b = rand(rng, size(A, 1))
       check = A \ b
-      Acf = CondensedFactorization(A, L, C)
+      Acf = CondensedFactorization(A, L, C; sparse_local_blocks=sparse)
       x = solvefunc(Acf, b)
       @test isapprox(A * x, b; atol=tol)
       @test isapprox(A * check, b; atol=tol)
@@ -65,7 +66,7 @@ end
 
       b = rand(rng, size(A, 1))
       check = A \ b
-      Acf = CondensedFactorization(A, L, C)
+      Acf = CondensedFactorization(A, L, C; sparse_local_blocks=sparse)
       x = solvefunc(Acf, b)
       @test isapprox(A * x, b; atol=tol)
       @test isapprox(A * check, b; atol=tol)
@@ -73,10 +74,11 @@ end
     end
   end
 
-  @testset "$label" for (label, solvefunc) in (
+  @testset "$label sparse=$sparse" for (label, solvefunc) in (
                                                ("static_condensed_solve", static_condensed_solve),
                                                ("ldiv!", ldiv_wrapper),
-                                              )
+                                              ),
+                                       sparse in (false, true)
     @testset "($L,$C)" for (L, C, tol) in (
                                            ([3,2], [1], 1.0e-14),
                                            ([3,2,4], [2,3], 1.0e-14),
@@ -125,7 +127,7 @@ end
            z31 t32 A33]
       b = rand(rng, size(A, 1))
       check = A \ b
-      Acf = CondensedFactorization(A, L[1:2], C[1:1])
+      Acf = CondensedFactorization(A, L[1:2], C[1:1]; sparse_local_blocks=sparse)
       x = solvefunc(Acf, b)
       @test isapprox(A * x, b; atol=tol)
       @test isapprox(A * check, b; atol=tol)
@@ -139,7 +141,7 @@ end
              z51 z52 z53 t54 A55]
         b = rand(rng, size(A, 1))
         check = A \ b
-        Acf = CondensedFactorization(A, L[1:3], C[1:2])
+        Acf = CondensedFactorization(A, L[1:3], C[1:2]; sparse_local_blocks=sparse)
         x = solvefunc(Acf, b)
         @test isapprox(A * x, b; atol=tol)
         @test isapprox(A * check, b; atol=tol)

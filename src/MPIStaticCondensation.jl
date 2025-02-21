@@ -56,14 +56,14 @@ struct CondensedFactorization{T, M<:AbstractMatrix{T}, F} <: Factorization{T}
   localfactors::Dict{Int,F}
 end
 
-function CondensedFactorization(A::AbstractMatrix{T}, localblocksize::Integer, couplingblocksize::Integer) where T
+function CondensedFactorization(A::AbstractMatrix{T}, localblocksize::Integer, couplingblocksize::Integer; kwargs...) where T
   n = size(A, 1)
   ncouplingblocks = (n - localblocksize) ÷ (localblocksize + couplingblocksize)
   nlocalblocks = ncouplingblocks + 1
-  return CondensedFactorization(A, fill(localblocksize, nlocalblocks), fill(couplingblocksize, ncouplingblocks))
+  return CondensedFactorization(A, fill(localblocksize, nlocalblocks), fill(couplingblocksize, ncouplingblocks); kwargs...)
 end
 
-function CondensedFactorization(A::AbstractMatrix{T}, localblocksizes::Vector{<:Integer}, couplingblocksizes::Vector{<:Integer}) where T
+function CondensedFactorization(A::AbstractMatrix{T}, localblocksizes::Vector{<:Integer}, couplingblocksizes::Vector{<:Integer}; sparse_local_blocks=false) where T
   n = size(A, 1)
   ncouplingblocks = length(couplingblocksizes)
   nlocalblocks = length(localblocksizes)
@@ -93,7 +93,7 @@ function CondensedFactorization(A::AbstractMatrix{T}, localblocksizes::Vector{<:
     inds = (indices[i] .- indices[i][1] .+ 1) .+ reducedcoupledindices[c][end]
     push!(reducedcoupledindices, inds) 
   end
-  localfactors = factoriselocals(indices, A)
+  localfactors = factoriselocals(indices, A, sparse_local_blocks)
   return CondensedFactorization(A, indices, nlocalblocks, ncouplingblocks, reducedlocalindices, reducedcoupledindices, localblocksizes, couplingblocksizes, localfactors)
 end
 Base.size(A::CondensedFactorization) = (size(A.A, 1), size(A.A, 2))
@@ -103,12 +103,21 @@ iscouplingblock(i) = !islocalblock(i)
 localindices(A::CondensedFactorization) = A.indices[1:2:end]
 couplingindices(A::CondensedFactorization) = A.indices[2:2:end-1]
 
-function factoriselocals(lis, A)
-  localfact = lu(A[lis[1], lis[1]])
-  d = Dict{Int, typeof(localfact)}(1=>localfact)
-  for (i, li) in enumerate(lis) # parallelisable
-    iscouplingblock(i) && continue
-    d[i] = lu(A[li, li])
+function factoriselocals(lis, A, sparse_local_blocks)
+  if sparse_local_blocks
+    localfact = lu(sparse(A[lis[1], lis[1]]))
+    d = Dict{Int, typeof(localfact)}(1=>localfact)
+    for (i, li) in enumerate(lis) # parallelisable
+        iscouplingblock(i) && continue
+        d[i] = lu(sparse(A[li, li]))
+    end
+  else
+    localfact = lu(A[lis[1], lis[1]])
+    d = Dict{Int, typeof(localfact)}(1=>localfact)
+    for (i, li) in enumerate(lis) # parallelisable
+        iscouplingblock(i) && continue
+        d[i] = lu(A[li, li])
+    end
   end
   return d
 end
