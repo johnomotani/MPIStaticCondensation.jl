@@ -1,3 +1,41 @@
+"""
+Does a direct solve for matrices that can be decomposed in the following form, where the
+sub-matrices are labelled by `M'iddle, `T'op, `B'ottom, `L'eft, `R'ight, `J'oin, `C'orner,
+`O'ther corner
+```math
+\\begin{align}
+\\left(\\begin{array}{ccccccc}
+M_{1} & R_{1} & 0 & 0 & 0 & 0\\\\
+B_{1} & J_{1} & T_{1} & C_{1} & 0 & 0\\\\
+0 & L_{1} & M_{2} & R_{2} & 0 & 0\\\\
+0 & O_{1} & B_{2} & J_{2} & T_{2} & C_{2}\\\\
+0 & 0 & 0 & L_{2} & M_{3} & R_{3}\\\\
+0 & 0 & 0 & O_{2} & B_{3} & J_{3}\\\\
+ &  &  &  &  &  & \\ddots
+\\end{array}\\right)\\cdot\\left(\\begin{array}{c}
+V_{1}\\\\
+S_{1}\\\\
+V_{2}\\\\
+S_{2}\\\\
+V_{3}\\\\
+S_{3}\\\\
+\\vdots
+\\end{array}\\right)=\\left(\\begin{array}{c}
+\\alpha_{1}\\\\
+\\beta_{1}\\\\
+\\alpha_{2}\\\\
+\\beta_{2}\\\\
+\\alpha_{3}\\\\
+\\beta_{3}\\\\
+\\vdots
+\\end{array}\\right)
+\\end{align}
+```
+Matrices like this can be transformed into a reduced matrix solve for just the \$S_{i}\$,
+combined with decoupled solves for \$V_{n}\$ that can be done in parallel. This is most
+likely to work well when the \$V_{i}\$ are much larger than the \$S_{i}\$, so that the
+reduced matrix is much smaller than the original matrix.
+"""
 module MPIStaticCondensation
 
 export CondensedFactorization, static_condensed_solve
@@ -14,22 +52,29 @@ struct CondensedFactorization{T, M<:AbstractMatrix{T}} <: AbstractMatrix{T}
   reducedcoupledindices::Vector{UnitRange{Int}}
 end
 
-function CondensedFactorization(A::AbstractMatrix{T}, localblocksize, couplingblocksize) where T
+function CondensedFactorization(A::AbstractMatrix{T}, localblocksize::Integer, couplingblocksize::Integer) where T
   n = size(A, 1)
   ncouplingblocks = (n - localblocksize) ÷ (localblocksize + couplingblocksize)
   nlocalblocks = ncouplingblocks + 1
+  return CondensedFactorization(A, fill(localblocksize, nlocalblocks), fill(couplingblocksize, ncouplingblocks))
+end
+
+function CondensedFactorization(A::AbstractMatrix{T}, localblocksizes::Vector{<:Integer}, couplingblocksizes::Vector{<:Integer}) where T
+  n = size(A, 1)
+  ncouplingblocks = length(couplingblocksizes)
+  nlocalblocks = length(localblocksizes)
 
   indices = Vector{UnitRange{Int}}()
   a = 1
-  for i = 1:nlocalblocks-1
-    inds = a:a + localblocksize - 1
+  for i = 1:ncouplingblocks
+    inds = a:a + localblocksizes[i] - 1
     push!(indices, inds)
-    a = a + localblocksize
-    inds = a:a + couplingblocksize - 1
+    a = a + localblocksizes[i]
+    inds = a:a + couplingblocksizes[i] - 1
     push!(indices, inds)
-    a = a + couplingblocksize
+    a = a + couplingblocksizes[i]
   end
-  push!(indices, a:a + localblocksize - 1)
+  push!(indices, a:a + localblocksizes[end] - 1)
   @assert indices[end][end] == size(A, 1) == size(A, 2)
 
   reducedlocalindices = Vector{UnitRange{Int}}()
