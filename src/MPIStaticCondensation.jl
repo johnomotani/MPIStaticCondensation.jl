@@ -38,18 +38,21 @@ reduced matrix is much smaller than the original matrix.
 """
 module MPIStaticCondensation
 
-export CondensedFactorization, static_condensed_solve
+export CondensedFactorization, static_condensed_solve, ldiv!
 
 using LinearAlgebra
+import LinearAlgebra: ldiv!
 using SparseArrays
 
-struct CondensedFactorization{T, M<:AbstractMatrix{T}} <: AbstractMatrix{T}
+struct CondensedFactorization{T, M<:AbstractMatrix{T}} <: Factorization{T}
   A::M
   indices::Vector{UnitRange{Int}}
   nlocalblocks::Int
   ncouplingblocks::Int
   reducedlocalindices::Vector{UnitRange{Int}}
   reducedcoupledindices::Vector{UnitRange{Int}}
+  localblocksizes::Vector{Int}
+  couplingblocksizes::Vector{Int}
 end
 
 function CondensedFactorization(A::AbstractMatrix{T}, localblocksize::Integer, couplingblocksize::Integer) where T
@@ -89,7 +92,7 @@ function CondensedFactorization(A::AbstractMatrix{T}, localblocksizes::Vector{<:
     inds = (indices[i] .- indices[i][1] .+ 1) .+ reducedcoupledindices[c][end]
     push!(reducedcoupledindices, inds) 
   end
-  return CondensedFactorization(A, indices, nlocalblocks, ncouplingblocks, reducedlocalindices, reducedcoupledindices)
+  return CondensedFactorization(A, indices, nlocalblocks, ncouplingblocks, reducedlocalindices, reducedcoupledindices, localblocksizes, couplingblocksizes)
 end
 Base.size(A::CondensedFactorization) = (size(A.A, 1), size(A.A, 2))
 Base.size(A::CondensedFactorization, i) = size(A.A, i)
@@ -224,13 +227,26 @@ function localx(A::CondensedFactorization{T}, xc, b, localsolutions, couplings) 
 end
 
 function static_condensed_solve(A::CondensedFactorization, b)
+  x = similar(b)
+  return ldiv!(x, A, b)
+end
+
+function ldiv!(x::AbstractVector, A::CondensedFactorization, b::AbstractVector)
   localfactors = factoriselocals(A)
   localsolutions = solvelocalparts(A, b, localfactors)
   couplings = calculatecouplings(A, localfactors)
   xc = coupledx(A, b, localsolutions, couplings)
   xl = localx(A, xc, b, localsolutions, couplings)
-  X = xl .+ xc
-  return X
+  @. x = xl + xc
+  return x
+end
+
+function ldiv!(x::AbstractMatrix, A::CondensedFactorization, b::AbstractMatrix)
+  @boundscheck size(x) == size(b) || error(BoundsError, " x $(size(x)) and b $(size(b)) are not the same size")
+  for icol ∈ 1:size(b,2)
+    @views ldiv!(x[:,icol], A, b[:,icol])
+  end
+  return x
 end
 
 end # module MPIStaticCondensation
