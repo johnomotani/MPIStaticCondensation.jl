@@ -55,6 +55,7 @@ struct CondensedFactorization{T, M<:AbstractMatrix{T}, F} <: Factorization{T}
   couplingblocksizes::Vector{Int}
   localfactors::Dict{Int,F}
   couplings::Dict{Tuple{Int, Int}, M}
+  coupledlhsfactorization::F
 end
 
 function CondensedFactorization(A::AbstractMatrix{T}, localblocksize::Integer, couplingblocksize::Integer; kwargs...) where T
@@ -96,7 +97,16 @@ function CondensedFactorization(A::AbstractMatrix{T}, localblocksizes::Vector{<:
   end
   localfactors = factoriselocals(indices, A, sparse_local_blocks)
   couplings = calculatecouplings(A, localfactors, indices)
-  return CondensedFactorization(A, indices, nlocalblocks, ncouplingblocks, reducedlocalindices, reducedcoupledindices, localblocksizes, couplingblocksizes, localfactors, couplings)
+  coupledlhs = assemblecoupledlhs(A, couplings, reducedcoupledindices, indices, ncouplingblocks)
+  if sparse_local_blocks
+    coupledlhsfactorization = lu(sparse(coupledlhs))
+  else
+    coupledlhsfactorization = lu(coupledlhs)
+  end
+  return CondensedFactorization(A, indices, nlocalblocks, ncouplingblocks,
+                                reducedlocalindices, reducedcoupledindices,
+                                localblocksizes, couplingblocksizes, localfactors,
+                                couplings, coupledlhsfactorization)
 end
 Base.size(A::CondensedFactorization) = (size(A.A, 1), size(A.A, 2))
 Base.size(A::CondensedFactorization, i) = size(A.A, i)
@@ -154,8 +164,8 @@ function totallockblocksize(A::CondensedFactorization)
   return sum(length(i) for i in A.reducedlocalindices)
 end
 
-function totalcouplingblocksize(A::CondensedFactorization)
-  return sum(length(i) for i in A.reducedcoupledindices)
+function totalcouplingblocksize(reducedcoupledindices)
+  return sum(length(i) for i in reducedcoupledindices)
 end
 
 function couplingblockindices(A::CondensedFactorization, i)
@@ -169,7 +179,7 @@ function localblockindices(A::CondensedFactorization, i)
 end
 
 function assemblecoupledrhs(A::CondensedFactorization, B, localsolutions)
-  b = similar(A.A, totalcouplingblocksize(A))
+  b = similar(A.A, totalcouplingblocksize(A.reducedcoupledindices))
   c = 0
   for (i, li) in enumerate(A.indices) # parallelisable
     islocalblock(i) && continue
@@ -182,28 +192,28 @@ function assemblecoupledrhs(A::CondensedFactorization, B, localsolutions)
   return b
 end
 
-function assemblecoupledlhs(A::CondensedFactorization)
-  couplings = A.couplings
-  M = similar(A.A, totalcouplingblocksize(A), totalcouplingblocksize(A))
+function assemblecoupledlhs(A, couplings, reducedcoupledindices, indices, ncouplingblocks)
+  M = similar(A, totalcouplingblocksize(reducedcoupledindices),
+              totalcouplingblocksize(reducedcoupledindices))
   fill!(M, 0)
   c = 0
-  for (i, li) in enumerate(A.indices) # parallelisable
+  for (i, li) in enumerate(indices) # parallelisable
     islocalblock(i) && continue
     c += 1
-    rows = A.reducedcoupledindices[c]
-    M[rows, rows] = A.A[li, li]
-    aim = A.A[li, A.indices[i-1]]
-    aip = A.A[li, A.indices[i+1]]
+    rows = reducedcoupledindices[c]
+    M[rows, rows] = A[li, li]
+    aim = A[li, indices[i-1]]
+    aip = A[li, indices[i+1]]
     M[rows, rows] .-= aim * couplings[(i - 1, i)]
     M[rows, rows] .-= aip * couplings[(i + 1, i)]
-    if c + 1 <= A.ncouplingblocks
-      right = A.reducedcoupledindices[c + 1]
-      M[rows, right] = A.A[li, A.indices[i + 2]]
+    if c + 1 <= ncouplingblocks
+      right = reducedcoupledindices[c + 1]
+      M[rows, right] = A[li, indices[i + 2]]
       M[rows, right] .-= aip * couplings[(i + 1, i + 2)]
     end
     if c - 1 >= 1
-      left = A.reducedcoupledindices[c - 1]
-      M[rows, left] = A.A[li, A.indices[i - 2]]
+      left = reducedcoupledindices[c - 1]
+      M[rows, left] = A[li, indices[i - 2]]
       M[rows, left] .-= aim * couplings[(i - 1, i - 2)]
     end
   end
@@ -211,9 +221,9 @@ function assemblecoupledlhs(A::CondensedFactorization)
 end
 
 function coupledx(A::CondensedFactorization{T}, b, localsolutions) where {T}
-  Ac = assemblecoupledlhs(A)
   bc = assemblecoupledrhs(A, b, localsolutions)
-  xc = Ac \ bc
+  xc = similar(bc)
+  ldiv!(xc, A.coupledlhsfactorization, bc)
   x = zeros(T, size(b)...)
   c = 0
   for (i, ind) in enumerate(A.indices)
