@@ -1,40 +1,59 @@
 """
-Does a direct solve for matrices that can be decomposed in the following form, where the
-sub-matrices are labelled by `M'iddle, `T'op, `B'ottom, `L'eft, `R'ight, `J'oin, `C'orner,
-`O'ther corner
+Does a direct solve for matrix systems where the right-hand-side and solution vectors can
+be decomposed into locally-coupled blocks and joining elements, so that any element in a
+'locally-coupled block' is not coupled (by a non-zero matrix entry) to any other
+'locally-coupled block' except its own, but may be coupled to any of the 'joining elements'.
+
+Matrices of this type often result from finite element discretizations, where the degrees
+of freedom within the volume of an element (or contiguous group of elements) are coupled
+to themselves, but only couple to another element via the degrees of freedom on the
+surface shared by both elements. The 'locally coupled blocks' are then the interiors of
+the elements, and the 'joining elements' are those on the surfaces of elements.
+
+Using an algorithm suggested by the MFEM documentation
+(https://docs.mfem.org/html/classmfem_1_1StaticCondensation.html), write the full matrix
+system as
 ```math
 \\begin{align}
-\\left(\\begin{array}{ccccccc}
-M_{1} & R_{1} & 0 & 0 & 0 & 0\\\\
-B_{1} & J_{1} & T_{1} & C_{1} & 0 & 0\\\\
-0 & L_{1} & M_{2} & R_{2} & 0 & 0\\\\
-0 & O_{1} & B_{2} & J_{2} & T_{2} & C_{2}\\\\
-0 & 0 & 0 & L_{2} & M_{3} & R_{3}\\\\
-0 & 0 & 0 & O_{2} & B_{3} & J_{3}\\\\
- &  &  &  &  &  & \\ddots
+A\\cdot X &= U
+```
+By reordering the entries of X and B so that the 'local blocks' are the first entries,
+with each local block being a continuous chunk, followed by the 'joining elements', the
+matrix system can be rewritten as
+```math
+\\begin{align}
+\\left(\\begin{array}{cc}
+a & b\\\\
+c & d\\\\
 \\end{array}\\right)\\cdot\\left(\\begin{array}{c}
-V_{1}\\\\
-S_{1}\\\\
-V_{2}\\\\
-S_{2}\\\\
-V_{3}\\\\
-S_{3}\\\\
-\\vdots
+x\\\\
+y\\\\
 \\end{array}\\right)=\\left(\\begin{array}{c}
-\\alpha_{1}\\\\
-\\beta_{1}\\\\
-\\alpha_{2}\\\\
-\\beta_{2}\\\\
-\\alpha_{3}\\\\
-\\beta_{3}\\\\
-\\vdots
+u\\\\
+v\\\\
 \\end{array}\\right)
 \\end{align}
 ```
-Matrices like this can be transformed into a reduced matrix solve for just the \$S_{i}\$,
-combined with decoupled solves for \$V_{n}\$ that can be done in parallel. This is most
-likely to work well when the \$V_{i}\$ are much larger than the \$S_{i}\$, so that the
-reduced matrix is much smaller than the original matrix.
+In this form, \$a\$ is block-diagonal so \$a\\cdot x = u\$ can be solved efficiently, and
+parallelised. The remaining part of the solution is found by forming the Schur complement
+of \$a\$, doing a matrix-solve using that, and back-substituting, as follows.
+```math
+\\begin{align}
+& a\\cdot x + b \\cdot y = u \\\\
+& x = A^{-1}\\cdot u - A^{-1} \\cdot b \\cdot y \\\\
+& c\\cdot x + d\\cdot y = v \\\\
+& c\\cdot (A^{-1}\\cdot u - A^{-1} \\cdot b \\cdot y) + d\\cdot y = v \\\\
+& (d - c\\cdot A^{-1} \\cdot b) \\cdot y = v - c\\cdot A^{-1}\\cdot u \\\\
+& s\\cdot y = v - A^{-1}\\cdot u \\\\
+\\end{align}
+```
+where \$s = (d - c\\cdot A^{-1} \\cdot b)\$ is the 'Schur complement' of \$a\$. Once \$y\$
+is known, we can substitute back into the expression above for \$x\$
+```math
+\\begin{align}
+& x = A^{-1}\\cdot u - A^{-1} \\cdot b \\cdot y \\\\
+\\end{align}
+```
 """
 module MPIStaticCondensation
 
@@ -44,18 +63,18 @@ using LinearAlgebra
 import LinearAlgebra: ldiv!
 using SparseArrays
 
-struct CondensedFactorization{T, M<:AbstractMatrix{T}, F} <: Factorization{T}
-  A::M
-  indices::Vector{UnitRange{Int}}
-  nlocalblocks::Int
-  ncouplingblocks::Int
-  reducedlocalindices::Vector{UnitRange{Int}}
-  reducedcoupledindices::Vector{UnitRange{Int}}
-  localblocksizes::Vector{Int}
-  couplingblocksizes::Vector{Int}
-  localfactors::Dict{Int,F}
-  couplings::Dict{Tuple{Int, Int}, M}
-  coupledlhsfactorization::F
+struct CondensedFactorization{T, M<:AbstractMatrix{T}, F,
+                              LB<:Union{Vector{Vector{Int}},Vector{UnitRange{Int}}}} <: Factorization{T}
+  n::Int
+  n_local_blocks::Int
+  localblock_factorizations::Vector{F}
+  local_blocks::LB
+  joining_elements::Vector{Int}
+  split_c::Vector{M}
+  split_ainv_dot_b::Vector{M}
+  schur_complement_factorization::F
+  split_rhs::Vector{Vector{T}}
+  split_solution::Vector{Vector{T}}
 end
 
 function CondensedFactorization(A::AbstractMatrix{T}, localblocksize::Integer, couplingblocksize::Integer; kwargs...) where T
@@ -65,204 +84,184 @@ function CondensedFactorization(A::AbstractMatrix{T}, localblocksize::Integer, c
   return CondensedFactorization(A, fill(localblocksize, nlocalblocks), fill(couplingblocksize, ncouplingblocks); kwargs...)
 end
 
-function CondensedFactorization(A::AbstractMatrix{T}, localblocksizes::Vector{<:Integer}, couplingblocksizes::Vector{<:Integer}; sparse_local_blocks=false) where T
+function CondensedFactorization(A::AbstractMatrix{T}, localblocksizes::Vector{<:Integer}, couplingblocksizes::Vector{<:Integer}; kwargs...) where T
+    c = 1
+    local_blocks = [c:c+localblocksizes[1]-1]
+    c += localblocksizes[1]
+    for i in 1:length(localblocksizes)-1
+        c += couplingblocksizes[i]
+        push!(local_blocks, c:c+localblocksizes[i+1]-1)
+        c += localblocksizes[i+1]
+    end
+    return CondensedFactorization(A, local_blocks; kwargs...)
+end
+
+function CondensedFactorization(A::AbstractMatrix{T},
+                                local_blocks::Union{Vector{Vector{I}},Vector{UnitRange{I}}} where I <: Integer;
+                                sparse_local_blocks=false) where T
   n = size(A, 1)
-  ncouplingblocks = length(couplingblocksizes)
-  nlocalblocks = length(localblocksizes)
+  @assert n == size(A, 2)
+  n_local_blocks = length(local_blocks)
 
-  indices = Vector{UnitRange{Int}}()
-  a = 1
-  for i = 1:ncouplingblocks
-    inds = a:a + localblocksizes[i] - 1
-    push!(indices, inds)
-    a = a + localblocksizes[i]
-    inds = a:a + couplingblocksizes[i] - 1
-    push!(indices, inds)
-    a = a + couplingblocksizes[i]
+  @inbounds @boundscheck begin
+    # When `--check-bounds=yes`, verify that all the matrix elements that are supposed to
+    # be zero are actually zero.
+    for iblockx ∈ 1:n_local_blocks, iblocky ∈ 1:n_local_blocks
+      if iblockx == iblocky
+        # This is a local block that should have non-zero elements
+        continue
+      end
+      this_block = A[local_blocks[iblockx], local_blocks[iblocky]]
+      if !all(this_block .== 0.0)
+        error("In block ($iblockx,$iblocky), with row indices $(local_blocks[iblockx]) and "
+              * "column indices $(local_blocks[iblocky]), found non-zero entries where "
+              * "there should not be any.")
+      end
+    end
   end
-  push!(indices, a:a + localblocksizes[end] - 1)
-  @assert indices[end][end] == size(A, 1) == size(A, 2)
 
-  reducedlocalindices = Vector{UnitRange{Int}}()
-  push!(reducedlocalindices, indices[1])
-  for (c, i) in enumerate(3:2:length(indices))
-    inds = (indices[i] .- indices[i][1] .+ 1) .+ reducedlocalindices[c][end]
-    push!(reducedlocalindices, inds) 
+  all_indices = collect(1:n)
+  all_local_block_indices = union((inds isa UnitRange ? collect(inds) : inds for inds in local_blocks)...)
+  joining_elements = [i for i in all_indices if !(i in all_local_block_indices)]
+
+  # Check indices were unique, so all indices are now in either local_blocks or
+  # joining_elements but not both.
+  if !all(1 ≤ i ≤ n for inds in local_blocks for i in inds)
+    error("local_blocks contains indices outside the range of indices in A")
   end
-  reducedcoupledindices = Vector{UnitRange{Int}}()
-  push!(reducedcoupledindices, indices[2] .- indices[2][1] .+ 1)
-  for (c, i) in enumerate(4:2:length(indices))
-    inds = (indices[i] .- indices[i][1] .+ 1) .+ reducedcoupledindices[c][end]
-    push!(reducedcoupledindices, inds) 
+  if sum(length(inds) for inds in local_blocks) + length(joining_elements) != n
+    error("Total number of indices not equal to the size of A")
   end
-  localfactors = factoriselocals(indices, A, sparse_local_blocks)
-  couplings = calculatecouplings(A, localfactors, indices)
-  coupledlhs = assemblecoupledlhs(A, couplings, reducedcoupledindices, indices, ncouplingblocks)
+
+  all_block_sizes = [length(inds) for inds in local_blocks]
+  push!(all_block_sizes, length(joining_elements))
+  split_rhs = [similar(A, nblock) for nblock ∈ all_block_sizes]
+  split_solution = [similar(A, nblock) for nblock ∈ all_block_sizes]
+
+  split_b = [A[inds, joining_elements] for inds in local_blocks]
   if sparse_local_blocks
-    coupledlhsfactorization = lu(sparse(coupledlhs))
+    split_c = [sparse(A[joining_elements, inds]) for inds in local_blocks]
+    localblock_factorizations = [lu(sparse(@view(A[inds,inds]))) for inds in local_blocks]
   else
-    coupledlhsfactorization = lu(coupledlhs)
+    split_c = [A[joining_elements, inds] for inds in local_blocks]
+    localblock_factorizations = [lu(@view(A[inds,inds])) for inds in local_blocks]
   end
-  return CondensedFactorization(A, indices, nlocalblocks, ncouplingblocks,
-                                reducedlocalindices, reducedcoupledindices,
-                                localblocksizes, couplingblocksizes, localfactors,
-                                couplings, coupledlhsfactorization)
-end
-Base.size(A::CondensedFactorization) = (size(A.A, 1), size(A.A, 2))
-Base.size(A::CondensedFactorization, i) = size(A.A, i)
-islocalblock(i) = isodd(i)
-iscouplingblock(i) = !islocalblock(i)
-localindices(A::CondensedFactorization) = A.indices[1:2:end]
-couplingindices(A::CondensedFactorization) = A.indices[2:2:end-1]
 
-function factoriselocals(lis, A, sparse_local_blocks)
+  split_ainv_dot_b = [local_aniv \ local_b for (local_aniv, local_b)
+                      in zip(localblock_factorizations, split_b)]
+
+  schur_complement = A[joining_elements, joining_elements]
+  for (local_c, local_ainv_dot_b) in zip(split_c, split_ainv_dot_b)
+    schur_complement .-= local_c * local_ainv_dot_b
+  end
   if sparse_local_blocks
-    localfact = lu(sparse(A[lis[1], lis[1]]))
-    d = Dict{Int, typeof(localfact)}(1=>localfact)
-    for (i, li) in enumerate(lis) # parallelisable
-        iscouplingblock(i) && continue
-        d[i] = lu(sparse(A[li, li]))
-    end
+    split_ainv_dot_b = [sparse(local_ainv_dot_b) for local_ainv_dot_b in split_ainv_dot_b]
+    schur_complement_factorization = lu(sparse(schur_complement))
   else
-    localfact = lu(A[lis[1], lis[1]])
-    d = Dict{Int, typeof(localfact)}(1=>localfact)
-    for (i, li) in enumerate(lis) # parallelisable
-        iscouplingblock(i) && continue
-        d[i] = lu(A[li, li])
-    end
+    schur_complement_factorization = lu(schur_complement)
   end
-  return d
-end
 
-function calculatecouplings(A::M, localfactors, indices) where {M}
-  d = Dict{Tuple{Int, Int}, M}()
-  for (i, li) in enumerate(indices) # parallelisable
-    islocalblock(i) && continue
-    if i - 1 >= 1
-      lim = indices[i-1]
-      d[(i-1, i)] = localfactors[i-1] \ A[lim, li]
-    end
-    if i + 1 <= length(indices)
-      lip = indices[i+1]
-      d[(i+1, i)] = localfactors[i+1] \ A[lip, li]
-    end
+  return CondensedFactorization(n, n_local_blocks, localblock_factorizations, local_blocks,
+                                joining_elements, split_c, split_ainv_dot_b,
+                                schur_complement_factorization, split_rhs, split_solution)
+end
+Base.size(A::CondensedFactorization) = (A.n, A.n)
+Base.size(A::CondensedFactorization, i) = A.n
+
+function split_rhs!(A::CondensedFactorization, U::AbstractVector)
+  n_local_blocks = A.n_local_blocks
+  local_blocks = A.local_blocks
+  joining_elements = A.joining_elements
+  split_rhs = A.split_rhs
+
+  for iblock in 1:n_local_blocks
+    split_rhs[iblock] .= @view U[local_blocks[iblock]]
   end
-  return d
+
+  split_rhs[end] .= @view U[joining_elements]
+
+  return nothing
 end
 
-function solvelocalparts(A::CondensedFactorization{T,M,F}, b) where {T,M,F}
-  localfactors = A.localfactors
-  d = Dict{Int, M}()
-  for (i, li) in enumerate(A.indices) # parallelisable
-    iscouplingblock(i) && continue
-    d[i] = localfactors[i] \ b[li, :]
+function localblocks_solve!(A)
+  split_rhs = A.split_rhs
+  split_solution = A.split_solution
+
+  n_local_blocks = A.n_local_blocks
+  localblock_factorizations = A.localblock_factorizations
+
+  for iblock in 1:n_local_blocks
+    ldiv!(split_solution[iblock], localblock_factorizations[iblock], split_rhs[iblock])
   end
-  return d
+
+  return nothing
 end
 
-function totallockblocksize(A::CondensedFactorization)
-  return sum(length(i) for i in A.reducedlocalindices)
-end
+function schur_complement_solve!(A)
+  n_local_blocks = A.n_local_blocks
+  split_solution = A.split_solution
+  split_c = A.split_c
+  joining_elements_solution = split_solution[end]
+  joining_elements_rhs = A.split_rhs[end]
+  schur_complement_factorization = A.schur_complement_factorization
 
-function totalcouplingblocksize(reducedcoupledindices)
-  return sum(length(i) for i in reducedcoupledindices)
-end
-
-function couplingblockindices(A::CondensedFactorization, i)
-  @boundscheck @assert i > 1
-  return A.indices[i] .- A.indices[i-1][1] .+ 1
-end
-
-function localblockindices(A::CondensedFactorization, i)
-  @boundscheck @assert i > 1
-  return A.indices[i] .- A.indices[i-1][1] .+ 1
-end
-
-function assemblecoupledrhs(A::CondensedFactorization, B, localsolutions)
-  b = similar(A.A, totalcouplingblocksize(A.reducedcoupledindices))
-  c = 0
-  for (i, li) in enumerate(A.indices) # parallelisable
-    islocalblock(i) && continue
-    c += 1
-    rows = A.reducedcoupledindices[c]
-    @views b[rows, :] .= B[li, :]
-    @views b[rows, :] .-= A.A[li, A.indices[i-1]] * localsolutions[i-1]
-    @views b[rows, :] .-= A.A[li, A.indices[i+1]] * localsolutions[i+1]
+  for iblock in 1:n_local_blocks
+    joining_elements_rhs .-= split_c[iblock] * split_solution[iblock]
   end
-  return b
+
+  ldiv!(joining_elements_solution, schur_complement_factorization, joining_elements_rhs)
+
+  return nothing
 end
 
-function assemblecoupledlhs(A, couplings, reducedcoupledindices, indices, ncouplingblocks)
-  M = similar(A, totalcouplingblocksize(reducedcoupledindices),
-              totalcouplingblocksize(reducedcoupledindices))
-  fill!(M, 0)
-  c = 0
-  for (i, li) in enumerate(indices) # parallelisable
-    islocalblock(i) && continue
-    c += 1
-    rows = reducedcoupledindices[c]
-    M[rows, rows] = A[li, li]
-    aim = A[li, indices[i-1]]
-    aip = A[li, indices[i+1]]
-    M[rows, rows] .-= aim * couplings[(i - 1, i)]
-    M[rows, rows] .-= aip * couplings[(i + 1, i)]
-    if c + 1 <= ncouplingblocks
-      right = reducedcoupledindices[c + 1]
-      M[rows, right] = A[li, indices[i + 2]]
-      M[rows, right] .-= aip * couplings[(i + 1, i + 2)]
-    end
-    if c - 1 >= 1
-      left = reducedcoupledindices[c - 1]
-      M[rows, left] = A[li, indices[i - 2]]
-      M[rows, left] .-= aim * couplings[(i - 1, i - 2)]
-    end
+function x_backsubstitution!(A)
+  n_local_blocks = A.n_local_blocks
+  split_solution = A.split_solution
+  joining_elements_solution = split_solution[end]
+  split_ainv_dot_b = A.split_ainv_dot_b
+
+  for iblock in 1:n_local_blocks
+    split_solution[iblock] .-= split_ainv_dot_b[iblock] * joining_elements_solution
   end
-  return M
+
+  return nothing
 end
 
-function coupledx(A::CondensedFactorization{T}, b, localsolutions) where {T}
-  bc = assemblecoupledrhs(A, b, localsolutions)
-  xc = similar(bc)
-  ldiv!(xc, A.coupledlhsfactorization, bc)
-  x = zeros(T, size(b)...)
-  c = 0
-  for (i, ind) in enumerate(A.indices)
-    islocalblock(i) && continue
-    c += 1
-    x[ind, :] .= xc[A.reducedcoupledindices[c], :]
+function gather_split_solution!(X, A)
+  n_local_blocks = A.n_local_blocks
+  local_blocks = A.local_blocks
+  split_solution = A.split_solution
+  joining_elements = A.joining_elements
+
+  for iblock in 1:n_local_blocks
+    X[local_blocks[iblock]] .= split_solution[iblock]
   end
-  return x
+
+  X[joining_elements] .= split_solution[end]
+
+  return nothing
 end
 
-function localx(A::CondensedFactorization{T}, xc, b, localsolutions) where T
-  couplings = A.couplings
-  xl = zeros(T, size(b))
-  c = 0
-  for (i, li) in enumerate(A.indices) # parallelisable
-    iscouplingblock(i) && continue
-    c += 1
-    rows = A.reducedlocalindices[c]
-    xl[li, :] .= localsolutions[i]
-    for j in (i + 1, i - 1)
-      0 < j <= length(A.indices) || continue
-      xl[li, :] .-= couplings[(i, j)] * xc[A.indices[j], :]
-    end
-  end
-  return xl
+function ldiv!(X::AbstractVector, A::CondensedFactorization, U::AbstractVector)
+  split_rhs!(A, U)
+
+  # Compute a^{-1}.u
+  localblocks_solve!(A)
+
+  # Compute y
+  schur_complement_solve!(A)
+
+  # Back substitute for final solution for x
+  x_backsubstitution!(A)
+
+  gather_split_solution!(X, A)
+
+  return X
 end
 
-function static_condensed_solve(A::CondensedFactorization, b)
-  x = similar(b)
-  return ldiv!(x, A, b)
-end
-
-function ldiv!(x::AbstractVector, A::CondensedFactorization, b::AbstractVector)
-  localsolutions = solvelocalparts(A, b)
-  couplings = A.couplings
-  xc = coupledx(A, b, localsolutions)
-  xl = localx(A, xc, b, localsolutions)
-  @. x = xl + xc
-  return x
+function ldiv!(A::CondensedFactorization, U::Union{AbstractVector,AbstractMatrix})
+  # It is safe to pass the same array for both RHS and solution
+  return ldiv!(U, A, U)
 end
 
 function ldiv!(x::AbstractMatrix, A::CondensedFactorization, b::AbstractMatrix)
