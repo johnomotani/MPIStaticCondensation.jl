@@ -54,6 +54,7 @@ struct CondensedFactorization{T, M<:AbstractMatrix{T}, F} <: Factorization{T}
   localblocksizes::Vector{Int}
   couplingblocksizes::Vector{Int}
   localfactors::Dict{Int,F}
+  couplings::Dict{Tuple{Int, Int}, M}
 end
 
 function CondensedFactorization(A::AbstractMatrix{T}, localblocksize::Integer, couplingblocksize::Integer; kwargs...) where T
@@ -94,7 +95,8 @@ function CondensedFactorization(A::AbstractMatrix{T}, localblocksizes::Vector{<:
     push!(reducedcoupledindices, inds) 
   end
   localfactors = factoriselocals(indices, A, sparse_local_blocks)
-  return CondensedFactorization(A, indices, nlocalblocks, ncouplingblocks, reducedlocalindices, reducedcoupledindices, localblocksizes, couplingblocksizes, localfactors)
+  couplings = calculatecouplings(A, localfactors, indices)
+  return CondensedFactorization(A, indices, nlocalblocks, ncouplingblocks, reducedlocalindices, reducedcoupledindices, localblocksizes, couplingblocksizes, localfactors, couplings)
 end
 Base.size(A::CondensedFactorization) = (size(A.A, 1), size(A.A, 2))
 Base.size(A::CondensedFactorization, i) = size(A.A, i)
@@ -122,18 +124,17 @@ function factoriselocals(lis, A, sparse_local_blocks)
   return d
 end
 
-function calculatecouplings(A::CondensedFactorization{T,M,F}) where {T,M,F}
-  localfactors = A.localfactors
+function calculatecouplings(A::M, localfactors, indices) where {M}
   d = Dict{Tuple{Int, Int}, M}()
-  for (i, li) in enumerate(A.indices) # parallelisable
+  for (i, li) in enumerate(indices) # parallelisable
     islocalblock(i) && continue
     if i - 1 >= 1
-      lim = A.indices[i-1]
-      d[(i-1, i)] = localfactors[i-1] \ A.A[lim, li]
+      lim = indices[i-1]
+      d[(i-1, i)] = localfactors[i-1] \ A[lim, li]
     end
-    if i + 1 <= length(A.indices)
-      lip = A.indices[i+1]
-      d[(i+1, i)] = localfactors[i+1] \ A.A[lip, li]
+    if i + 1 <= length(indices)
+      lip = indices[i+1]
+      d[(i+1, i)] = localfactors[i+1] \ A[lip, li]
     end
   end
   return d
@@ -167,7 +168,7 @@ function localblockindices(A::CondensedFactorization, i)
   return A.indices[i] .- A.indices[i-1][1] .+ 1
 end
 
-function assemblecoupledrhs(A::CondensedFactorization, B, localsolutions, couplings)
+function assemblecoupledrhs(A::CondensedFactorization, B, localsolutions)
   b = similar(A.A, totalcouplingblocksize(A))
   c = 0
   for (i, li) in enumerate(A.indices) # parallelisable
@@ -181,7 +182,8 @@ function assemblecoupledrhs(A::CondensedFactorization, B, localsolutions, coupli
   return b
 end
 
-function assemblecoupledlhs(A::CondensedFactorization, couplings)
+function assemblecoupledlhs(A::CondensedFactorization)
+  couplings = A.couplings
   M = similar(A.A, totalcouplingblocksize(A), totalcouplingblocksize(A))
   fill!(M, 0)
   c = 0
@@ -208,9 +210,9 @@ function assemblecoupledlhs(A::CondensedFactorization, couplings)
   return M
 end
 
-function coupledx(A::CondensedFactorization{T}, b, localsolutions, couplings) where {T}
-  Ac = assemblecoupledlhs(A, couplings)
-  bc = assemblecoupledrhs(A, b, localsolutions, couplings)
+function coupledx(A::CondensedFactorization{T}, b, localsolutions) where {T}
+  Ac = assemblecoupledlhs(A)
+  bc = assemblecoupledrhs(A, b, localsolutions)
   xc = Ac \ bc
   x = zeros(T, size(b)...)
   c = 0
@@ -222,7 +224,8 @@ function coupledx(A::CondensedFactorization{T}, b, localsolutions, couplings) wh
   return x
 end
 
-function localx(A::CondensedFactorization{T}, xc, b, localsolutions, couplings) where T
+function localx(A::CondensedFactorization{T}, xc, b, localsolutions) where T
+  couplings = A.couplings
   xl = zeros(T, size(b))
   c = 0
   for (i, li) in enumerate(A.indices) # parallelisable
@@ -245,9 +248,9 @@ end
 
 function ldiv!(x::AbstractVector, A::CondensedFactorization, b::AbstractVector)
   localsolutions = solvelocalparts(A, b)
-  couplings = calculatecouplings(A)
-  xc = coupledx(A, b, localsolutions, couplings)
-  xl = localx(A, xc, b, localsolutions, couplings)
+  couplings = A.couplings
+  xc = coupledx(A, b, localsolutions)
+  xl = localx(A, xc, b, localsolutions)
   @. x = xl + xc
   return x
 end
