@@ -185,9 +185,9 @@ function assemblecoupledrhs(A::CondensedFactorization, B, localsolutions)
     islocalblock(i) && continue
     c += 1
     rows = A.reducedcoupledindices[c]
-    b[rows, :] .= B[li, :]
-    b[rows, :] .-= A.A[li, A.indices[i-1]] * localsolutions[i-1]
-    b[rows, :] .-= A.A[li, A.indices[i+1]] * localsolutions[i+1]
+    @views b[rows, :] .= B[li, :]
+    @views b[rows, :] .-= A.A[li, A.indices[i-1]] * localsolutions[i-1]
+    @views b[rows, :] .-= A.A[li, A.indices[i+1]] * localsolutions[i+1]
   end
   return b
 end
