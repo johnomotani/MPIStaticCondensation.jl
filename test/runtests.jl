@@ -139,7 +139,7 @@ using MPIStaticCondensation
 
   fe_tol = 1.0e-14
   @testset "finite-element like ($nelement_x, $ngrid_x, $nelement_y, $ngrid_y) sparse=$sparse" for
-      sparse in (false, true), nelement_x in 2:6, ngrid_x in 3:6, nelement_y in 2:6, ngrid_y in 3:6
+      sparse in (false, true), nelement_x in 1:6, ngrid_x in 3:6, nelement_y in 1:6, ngrid_y in 3:6
 
     rng = StableRNG(0)
 

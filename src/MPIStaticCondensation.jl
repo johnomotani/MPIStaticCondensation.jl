@@ -63,16 +63,17 @@ using LinearAlgebra
 import LinearAlgebra: ldiv!
 using SparseArrays
 
-struct CondensedFactorization{T, M<:AbstractMatrix{T}, F,
+struct CondensedFactorization{T, M<:AbstractMatrix{T}, F1<:Factorization{T},
+                              F2<:Union{Factorization{T},Nothing},
                               LB<:Union{Vector{Vector{Int}},Vector{UnitRange{Int}}}} <: Factorization{T}
   n::Int
   n_local_blocks::Int
-  localblock_factorizations::Vector{F}
+  localblock_factorizations::Vector{F1}
   local_blocks::LB
   joining_elements::Vector{Int}
   split_c::Vector{M}
   split_ainv_dot_b::Vector{M}
-  schur_complement_factorization::F
+  schur_complement_factorization::F2
   split_rhs::Vector{Vector{T}}
   split_solution::Vector{Vector{T}}
 end
@@ -149,13 +150,17 @@ function CondensedFactorization(A::AbstractMatrix{T},
 
   split_ainv_dot_b = [local_aniv \ local_b for (local_aniv, local_b)
                       in zip(localblock_factorizations, split_b)]
+  if sparse_local_blocks
+    split_ainv_dot_b = [sparse(local_ainv_dot_b) for local_ainv_dot_b in split_ainv_dot_b]
+  end
 
   schur_complement = A[joining_elements, joining_elements]
   for (local_c, local_ainv_dot_b) in zip(split_c, split_ainv_dot_b)
     schur_complement .-= local_c * local_ainv_dot_b
   end
-  if sparse_local_blocks
-    split_ainv_dot_b = [sparse(local_ainv_dot_b) for local_ainv_dot_b in split_ainv_dot_b]
+  if size(schur_complement) == (0, 0)
+      schur_complement_factorization = nothing
+  elseif sparse_local_blocks
     schur_complement_factorization = lu(sparse(schur_complement))
   else
     schur_complement_factorization = lu(schur_complement)
@@ -198,12 +203,16 @@ function localblocks_solve!(A)
 end
 
 function schur_complement_solve!(A)
+  schur_complement_factorization = A.schur_complement_factorization
+  if schur_complement_factorization === nothing
+      # Schur complement is size-(0,0), so nothing to do.
+      return nothing
+  end
   n_local_blocks = A.n_local_blocks
   split_solution = A.split_solution
   split_c = A.split_c
   joining_elements_solution = split_solution[end]
   joining_elements_rhs = A.split_rhs[end]
-  schur_complement_factorization = A.schur_complement_factorization
 
   for iblock in 1:n_local_blocks
     joining_elements_rhs .-= split_c[iblock] * split_solution[iblock]
