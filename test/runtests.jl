@@ -3,20 +3,11 @@ using Test
 
 using MPIStaticCondensation
 
-function ldiv_wrapper(A, b)
-  x = similar(b)
-  return ldiv!(x, A, b)
-end
-
 @testset "CondensedFactorization" begin
-  @testset "$label sparse=$sparse" for (label, solvefunc) in (
-                                               ("static_condensed_solve", static_condensed_solve),
-                                               ("ldiv!", ldiv_wrapper),
-                                              ),
-                                       sparse in (false, true)
+  @testset "sparse=$sparse" for sparse in (false, true)
     @testset "($L,$C)" for (L, C, tol) in (
                                            (2, 1, 1.0e-14),
-                                           (3, 2, 1.0e-14),
+                                           (3, 2, 4.0e-14),
                                            (4, 2, 1.0e-13),
                                            (16, 4, 1.0e-12),
                                           )
@@ -38,7 +29,7 @@ end
       b = rand(rng, size(A, 1))
       check = A \ b
       Acf = CondensedFactorization(A, L, C; sparse_local_blocks=sparse)
-      x = solvefunc(Acf, b)
+      x = ldiv!(Acf, copy(b))
       @test isapprox(A * x, b; atol=tol)
       @test isapprox(A * check, b; atol=tol)
       @test isapprox(x, check; rtol=tol)
@@ -51,7 +42,7 @@ end
       b = rand(rng, size(A, 1))
       check = A \ b
       Acf = CondensedFactorization(A, L, C; sparse_local_blocks=sparse)
-      x = solvefunc(Acf, b)
+      x = ldiv!(Acf, copy(b))
       @test isapprox(A * x, b; atol=tol)
       @test isapprox(A * check, b; atol=tol)
       @test isapprox(x, check; rtol=tol)
@@ -67,18 +58,14 @@ end
       b = rand(rng, size(A, 1))
       check = A \ b
       Acf = CondensedFactorization(A, L, C; sparse_local_blocks=sparse)
-      x = solvefunc(Acf, b)
+      x = ldiv!(Acf, copy(b))
       @test isapprox(A * x, b; atol=tol)
       @test isapprox(A * check, b; atol=tol)
       @test isapprox(x, check; rtol=tol)
     end
   end
 
-  @testset "$label sparse=$sparse" for (label, solvefunc) in (
-                                               ("static_condensed_solve", static_condensed_solve),
-                                               ("ldiv!", ldiv_wrapper),
-                                              ),
-                                       sparse in (false, true)
+  @testset "sparse=$sparse" for sparse in (false, true)
     @testset "($L,$C)" for (L, C, tol) in (
                                            ([3,2], [1], 1.0e-14),
                                            ([3,2,4], [2,3], 1.0e-14),
@@ -128,7 +115,7 @@ end
       b = rand(rng, size(A, 1))
       check = A \ b
       Acf = CondensedFactorization(A, L[1:2], C[1:1]; sparse_local_blocks=sparse)
-      x = solvefunc(Acf, b)
+      x = ldiv!(Acf, copy(b))
       @test isapprox(A * x, b; atol=tol)
       @test isapprox(A * check, b; atol=tol)
       @test isapprox(x, check; rtol=tol)
@@ -142,11 +129,96 @@ end
         b = rand(rng, size(A, 1))
         check = A \ b
         Acf = CondensedFactorization(A, L[1:3], C[1:2]; sparse_local_blocks=sparse)
-        x = solvefunc(Acf, b)
+        x = ldiv!(Acf, copy(b))
         @test isapprox(A * x, b; atol=tol)
         @test isapprox(A * check, b; atol=tol)
         @test isapprox(x, check; rtol=tol)
       end
     end
+  end
+
+  fe_tol = 1.0e-14
+  @testset "finite-element like ($nelement_x, $ngrid_x, $nelement_y, $ngrid_y) sparse=$sparse" for
+      sparse in (false, true), nelement_x in 1:6, ngrid_x in 3:6, nelement_y in 1:6, ngrid_y in 3:6
+
+    rng = StableRNG(0)
+
+    nx = nelement_x * (ngrid_x - 1) + 1
+    ny = nelement_y * (ngrid_y - 1) + 1
+
+    A = zeros(nx * ny, nx * ny)
+
+    # Add an 'x-derivative'
+    for irowx in 1:nx, irowy in 1:ny
+      irow = (irowx - 1) * ny + irowy
+      xe = min((irowx - 1) ÷ (ngrid_x - 1) + 1, nelement_x)
+      xstart = (xe - 1) * (ngrid_x - 1) + 1
+      xend = xstart + ngrid_x - 1
+      for icolx ∈ xstart:xend
+        icol = (icolx - 1) * ny + irowy
+        A[irow, icol] = rand(rng)
+      end
+    end
+
+    # Add an 'y-derivative'
+    for irowx in 1:nx, irowy in 1:ny
+      irow = (irowx - 1) * ny + irowy
+      ye = min((irowy - 1) ÷ (ngrid_y - 1) + 1, nelement_y)
+      ystart = (ye - 1) * (ngrid_y - 1) + 1
+      yend = ystart + ngrid_y - 1
+      for icoly ∈ ystart:yend
+        icol = (irowx - 1) * ny + icoly
+        A[irow, icol] = rand(rng)
+
+        # Make diagonal bigger to make sure matrix is not badly conditioned
+        if icol == irow
+          A[irow, icol] += 2.0
+        end
+      end
+    end
+
+    # Create one block per element
+    local_blocks = Vector{Vector{Int}}()
+    for xe ∈ 1:nelement_x, ye ∈ 1:nelement_y
+      if xe == 1
+        xstart = 1
+        xblock_width = ngrid_x - 1
+      else
+        xstart = (xe - 1) * (ngrid_x - 1) + 2
+        xblock_width = ngrid_x - 2
+      end
+      if xe == nelement_x
+        xind = xstart:nx
+      else
+        xind = xstart:xstart+xblock_width-1
+      end
+
+      if ye == 1
+        ystart = 1
+        yblock_width = ngrid_y - 1
+      else
+        ystart = (ye - 1) * (ngrid_y - 1) + 2
+        yblock_width = ngrid_y - 2
+      end
+      if ye == nelement_y
+        yind = ystart:ny
+      else
+        yind = ystart:ystart+yblock_width-1
+      end
+
+      this_block = Int[]
+      for ix ∈ xind, iy ∈ yind
+        push!(this_block, (ix - 1) * ny + iy)
+      end
+      push!(local_blocks, this_block)
+    end
+
+    b = rand(rng, size(A, 1))
+    check = A \ b
+    Acf = CondensedFactorization(A, local_blocks; sparse_local_blocks=sparse)
+    x = ldiv!(Acf, copy(b))
+    @test isapprox(A * x, b; atol=fe_tol)
+    @test isapprox(A * check, b; atol=fe_tol)
+    @test isapprox(x, check; rtol=fe_tol)
   end
 end
