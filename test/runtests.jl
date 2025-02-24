@@ -1,3 +1,4 @@
+using LinearAlgebra
 using MPI
 using StableRNGs
 using Test
@@ -7,6 +8,8 @@ using MPIStaticCondensation
 if !MPI.Initialized()
   MPI.Init()
 end
+
+LinearAlgebra.BLAS.set_num_threads(1)
 
 # Allocate a shared-memory array using MPI
 function allocate_shared(comm, dims)
