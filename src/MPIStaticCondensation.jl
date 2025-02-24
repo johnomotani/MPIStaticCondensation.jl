@@ -156,7 +156,7 @@ function CondensedFactorization(A::AbstractMatrix{T},
 
   schur_complement = A[joining_elements, joining_elements]
   for (local_c, local_ainv_dot_b) in zip(split_c, split_ainv_dot_b)
-    schur_complement .-= local_c * local_ainv_dot_b
+    mul!(schur_complement, local_c, local_ainv_dot_b, -1.0, 1.0)
   end
   if size(schur_complement) == (0, 0)
       schur_complement_factorization = nothing
@@ -215,7 +215,7 @@ function schur_complement_solve!(A)
   joining_elements_rhs = A.split_rhs[end]
 
   for iblock in 1:n_local_blocks
-    joining_elements_rhs .-= split_c[iblock] * split_solution[iblock]
+    mul!(joining_elements_rhs, split_c[iblock], split_solution[iblock], -1.0, 1.0)
   end
 
   ldiv!(joining_elements_solution, schur_complement_factorization, joining_elements_rhs)
@@ -230,7 +230,7 @@ function x_backsubstitution!(A)
   split_ainv_dot_b = A.split_ainv_dot_b
 
   for iblock in 1:n_local_blocks
-    split_solution[iblock] .-= split_ainv_dot_b[iblock] * joining_elements_solution
+    mul!(split_solution[iblock], split_ainv_dot_b[iblock], joining_elements_solution, -1.0, 1.0)
   end
 
   return nothing

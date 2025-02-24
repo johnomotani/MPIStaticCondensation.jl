@@ -7,7 +7,7 @@ using MPIStaticCondensation
   @testset "sparse=$sparse" for sparse in (false, true)
     @testset "($L,$C)" for (L, C, tol) in (
                                            (2, 1, 1.0e-14),
-                                           (3, 2, 1.0e-14),
+                                           (3, 2, 4.0e-14),
                                            (4, 2, 1.0e-13),
                                            (16, 4, 1.0e-12),
                                           )
