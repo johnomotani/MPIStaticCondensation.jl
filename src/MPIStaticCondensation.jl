@@ -64,6 +64,7 @@ using LinearAlgebra
 import LinearAlgebra: ldiv!
 using MPI
 using SparseArrays
+using TimerOutputs
 
 mutable struct CondensedFactorization{T, M<:AbstractMatrix{T}, F1<:Factorization{T},
                                       F2<:Union{Factorization{T},Nothing},
@@ -293,8 +294,9 @@ end
 Base.size(A::CondensedFactorization) = (A.n, A.n)
 Base.size(A::CondensedFactorization, i) = A.n
 
-@inline function _check_array_zeros(cf, A)
+@inline function _check_array_zeros(cf, A, timer)
   @boundscheck begin
+@timeit timer "check array zeros" begin
     # When `--check-bounds=yes`, verify that all the matrix elements that are supposed to
     # be zero are actually zero.
     local_blocks = cf.local_blocks
@@ -314,11 +316,12 @@ Base.size(A::CondensedFactorization, i) = A.n
               * "there should not be any.")
       end
     end
+end
   end
   return nothing
 end
 
-function update_condensed_factorization!(cf::CondensedFactorization{T}, A::AbstractMatrix{T}) where T
+function update_condensed_factorization!(cf::CondensedFactorization{T}, A::AbstractMatrix{T}, timer=TimerOutput()) where T
   n = cf.n
   @assert size(A) == (n, n)
 
@@ -326,10 +329,13 @@ function update_condensed_factorization!(cf::CondensedFactorization{T}, A::Abstr
   joining_elements = cf.joining_elements
   sparse_local_blocks = cf.sparse_local_blocks
 
-  @inbounds _check_array_zeros(cf, A)
+  @inbounds _check_array_zeros(cf, A, timer)
 
+@timeit timer "split b" begin
   split_b = [A[inds, joining_elements] for inds in my_blocks]
+end
   if sparse_local_blocks
+@timeit timer "sparse localblock factorizations" begin
     cf.split_c .= [sparse(@view(A[joining_elements, inds])) for inds in my_blocks]
     for (i, (fac,inds)) in enumerate(zip(cf.localblock_factorizations, my_blocks))
       sparse_block = sparse(@view(A[inds,inds]))
@@ -342,7 +348,9 @@ function update_condensed_factorization!(cf::CondensedFactorization{T}, A::Abstr
         cf.localblock_factorizations[i] = lu(sparse_block)
       end
     end
+end
   else
+@timeit timer "dense localblock factorizations" begin
     for (c,inds) in zip(cf.split_c, my_blocks)
       c .= @view A[joining_elements, inds]
     end
@@ -352,13 +360,17 @@ function update_condensed_factorization!(cf::CondensedFactorization{T}, A::Abstr
       mat .= @view A[inds,inds]
       cf.localblock_factorizations[i] = lu!(mat)
     end
+end
   end
 
   if sparse_local_blocks
+@timeit timer "allocate dense new_ainv_dot_b inv" begin
     new_ainv_dot_b = [similar(local_b) for local_b in split_b]
+end
   else
     new_ainv_dot_b = cf.split_ainv_dot_b
   end
+@timeit timer "sparse ainv_dot_b inv" begin
   for (aib, local_ainv, local_b) in zip(new_ainv_dot_b, cf.localblock_factorizations, split_b)
     for icol in 1:size(local_b, 2)
       this_col = @view local_b[:,icol]
@@ -369,22 +381,30 @@ function update_condensed_factorization!(cf::CondensedFactorization{T}, A::Abstr
       end
     end
   end
+end
   if sparse_local_blocks
+@timeit timer "sparse ainv_dot_b sparsify" begin
     cf.split_ainv_dot_b .= [sparse(local_ainv_dot_b) for local_ainv_dot_b in new_ainv_dot_b]
+end
   end
 
   if length(cf.joining_elements) == 0
     # Nothing to do as Schur complement is empty
   elseif cf.shared_comm_rank == cf.shared_comm_size - 1
+@timeit timer "schur_complement mul!" begin
     # Last rank on the communicator does the Schur-complement solve.
     schur_complement = A[joining_elements, joining_elements]
     for (local_c, local_ainv_dot_b) in zip(cf.split_c, new_ainv_dot_b)
       mul!(schur_complement, local_c, local_ainv_dot_b, -1.0, 1.0)
     end
+end
+@timeit timer "schur_complement Reduce!" begin
     if cf.shared_comm !== nothing
       MPI.Reduce!(schur_complement, +, cf.shared_comm; root=cf.shared_comm_size-1)
     end
+end
     if sparse_local_blocks
+@timeit timer "schur_complement lu!" begin
       sparse_schur_complement = sparse(schur_complement)
       try
         lu!(cf.schur_complement_factorization, sparse_schur_complement)
@@ -394,7 +414,9 @@ function update_condensed_factorization!(cf::CondensedFactorization{T}, A::Abstr
         end
         cf.schur_complement_factorization = lu(sparse_schur_complement)
       end
+end
     else
+@timeit timer "schur_complement lu" begin
       new_factorization = lu(schur_complement)
       cf.schur_complement_factorization.factors .= new_factorization.factors
       cf.schur_complement_factorization.ipiv .= new_factorization.ipiv
@@ -402,15 +424,20 @@ function update_condensed_factorization!(cf::CondensedFactorization{T}, A::Abstr
         error("New schur_complement_factorization has info=$(new_factorization.info). "
               * "Expected same as original $(cf.schur_complement_factorization.info)")
       end
+end
     end
   else
     # Other ranks need to add contributions to Schur-complement matrix, and pass these to
     # last rank.
+@timeit timer "schur_complement mul!" begin
     schur_complement = zeros(length(joining_elements), length(joining_elements))
     for (local_c, local_ainv_dot_b) in zip(cf.split_c, new_ainv_dot_b)
       mul!(schur_complement, local_c, local_ainv_dot_b, -1.0, 1.0)
     end
+end
+@timeit timer "schur_complement Reduce!" begin
     MPI.Reduce!(schur_complement, +, cf.shared_comm; root=cf.shared_comm_size-1)
+end
     schur_complement_factorization = nothing
   end
 
@@ -449,7 +476,7 @@ function localblocks_solve!(A)
   return nothing
 end
 
-function schur_complement_solve!(A)
+function schur_complement_solve!(A, timer)
   joining_elements_solution = A.joining_elements_solution
   if length(joining_elements_solution) == 0
       # No joining elements, so nothing to do.
@@ -467,17 +494,22 @@ function schur_complement_solve!(A)
   # Add MPI.Barrier() calls to ensure joining_elements_rhs is modified sequentially by
   # each rank.
   if shared_comm === nothing
+@timeit timer "split_c mul! serial" begin
     for iblock in 1:n_my_blocks
       mul!(joining_elements_rhs, split_c[iblock], split_solution_local[iblock], -1.0, 1.0)
     end
+end
   else
     joining_elements_rhs_unshared_buffer = A.joining_elements_rhs_unshared_buffer
     if shared_comm_rank == 0
+@timeit timer "split_c mul! rank0" begin
       for iblock in 1:n_my_blocks
         mul!(joining_elements_rhs, split_c[iblock],
              split_solution_local[iblock], -1.0, 1.0)
       end
+end
     else
+@timeit timer "split_c mul! rankn" begin
       if n_my_blocks > 0
         mul!(joining_elements_rhs_unshared_buffer, split_c[1],
              split_solution_local[1])
@@ -486,20 +518,25 @@ function schur_complement_solve!(A)
         mul!(joining_elements_rhs_unshared_buffer, split_c[iblock],
              split_solution_local[iblock], 1.0, 1.0)
       end
+end
+@timeit timer "split_c Barriers before rankn" begin
       for r ∈ 1:shared_comm_rank
         MPI.Barrier(shared_comm)
       end
       joining_elements_rhs .-= joining_elements_rhs_unshared_buffer
+end
     end
+@timeit timer "split_c final Barriers" begin
     for r ∈ shared_comm_rank+1:shared_comm_size - 1
       MPI.Barrier(shared_comm)
     end
+end
   end
 
   # Last rank was the last one to modify joining_element_rhs, so if it does the ldiv!()
   # then we do not need an extra MPI.Barrier first
   if shared_comm_rank == shared_comm_size - 1
-    ldiv!(joining_elements_solution, schur_complement_factorization, joining_elements_rhs)
+    @timeit timer "joining elements ldiv!" ldiv!(joining_elements_solution, schur_complement_factorization, joining_elements_rhs)
   end
 
   if shared_comm !== nothing
@@ -541,23 +578,23 @@ function gather_split_solution!(X, A)
   return nothing
 end
 
-function ldiv!(X::AbstractVector, A::CondensedFactorization, U::AbstractVector)
-  split_rhs!(A, U)
+function ldiv!(X::AbstractVector, A::CondensedFactorization, U::AbstractVector, timer=TimerOutput())
+  @timeit timer "split_rhs!" split_rhs!(A, U)
 
   # Compute a^{-1}.u
-  localblocks_solve!(A)
+  @timeit timer "localblocks_solve!" localblocks_solve!(A)
 
   if A.shared_comm !== nothing
     MPI.Barrier(A.shared_comm)
   end
 
   # Compute y
-  schur_complement_solve!(A)
+  @timeit timer "schur_complement_solve!" schur_complement_solve!(A, timer)
 
   # Back substitute for final solution for x
-  x_backsubstitution!(A)
+  @timeit timer "x_backsubstitution!" x_backsubstitution!(A)
 
-  gather_split_solution!(X, A)
+  @timeit timer "gather_split_solution!!" gather_split_solution!(X, A)
 
   return X
 end
