@@ -236,8 +236,17 @@ function CondensedFactorization(A::AbstractMatrix{T},
     localblock_factorizations = [lu(@view(A[inds,inds])) for inds in my_blocks]
   end
 
-  dense_ainv_dot_b = [local_aniv \ local_b for (local_aniv, local_b)
-                      in zip(localblock_factorizations, split_b)]
+  dense_ainv_dot_b = [similar(local_b) for local_b in split_b]
+  for (aib, local_ainv, local_b) in zip(dense_ainv_dot_b, localblock_factorizations, split_b)
+    for icol in 1:size(local_b, 2)
+      this_col = @view local_b[:,icol]
+      if any(this_col .!= 0.0)
+        @views ldiv!(aib[:,icol], local_ainv, this_col)
+      else
+        aib[:,icol] .= 0.0
+      end
+    end
+  end
   if sparse_local_blocks
     split_ainv_dot_b = [sparse(local_ainv_dot_b) for local_ainv_dot_b in dense_ainv_dot_b]
   else
@@ -340,16 +349,22 @@ function update_condensed_factorization!(cf::CondensedFactorization{T}, A::Abstr
   end
 
   if sparse_local_blocks
-    new_ainv_dot_b = [local_aniv \ local_b for (local_aniv, local_b)
-                      in zip(cf.localblock_factorizations, split_b)]
-    cf.split_ainv_dot_b .= [sparse(local_ainv_dot_b) for local_ainv_dot_b in new_ainv_dot_b]
+    new_ainv_dot_b = [similar(local_b) for local_b in split_b]
   else
-    for (local_ainv_dot_b, local_aniv, local_b) in
-        zip(cf.split_ainv_dot_b, cf.localblock_factorizations, split_b)
-
-      ldiv!(local_ainv_dot_b, local_aniv, local_b)
-    end
     new_ainv_dot_b = cf.split_ainv_dot_b
+  end
+  for (aib, local_ainv, local_b) in zip(new_ainv_dot_b, cf.localblock_factorizations, split_b)
+    for icol in 1:size(local_b, 2)
+      this_col = @view local_b[:,icol]
+      if any(this_col .!= 0.0)
+        @views ldiv!(aib[:,icol], local_ainv, this_col)
+      else
+        aib[:,icol] .= 0.0
+      end
+    end
+  end
+  if sparse_local_blocks
+    cf.split_ainv_dot_b .= [sparse(local_ainv_dot_b) for local_ainv_dot_b in new_ainv_dot_b]
   end
 
   if length(cf.joining_elements) == 0
