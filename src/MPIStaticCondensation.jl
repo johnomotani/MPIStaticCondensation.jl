@@ -236,16 +236,18 @@ function CondensedFactorization(A::AbstractMatrix{T},
     localblock_factorizations = [lu(@view(A[inds,inds])) for inds in my_blocks]
   end
 
-  split_ainv_dot_b = [local_aniv \ local_b for (local_aniv, local_b)
+  dense_ainv_dot_b = [local_aniv \ local_b for (local_aniv, local_b)
                       in zip(localblock_factorizations, split_b)]
   if sparse_local_blocks
-    split_ainv_dot_b = [sparse(local_ainv_dot_b) for local_ainv_dot_b in split_ainv_dot_b]
+    split_ainv_dot_b = [sparse(local_ainv_dot_b) for local_ainv_dot_b in dense_ainv_dot_b]
+  else
+    split_ainv_dot_b = dense_ainv_dot_b
   end
 
   if shared_comm_rank == shared_comm_size - 1
     # Last rank on the communicator does the Schur-complement solve.
     schur_complement = A[joining_elements, joining_elements]
-    for (local_c, local_ainv_dot_b) in zip(split_c, split_ainv_dot_b)
+    for (local_c, local_ainv_dot_b) in zip(split_c, dense_ainv_dot_b)
       mul!(schur_complement, local_c, local_ainv_dot_b, -1.0, 1.0)
     end
     if shared_MPI_comm !== nothing
@@ -262,7 +264,7 @@ function CondensedFactorization(A::AbstractMatrix{T},
     # Other ranks need to add contributions to Schur-complement matrix, and pass these to
     # last rank.
     schur_complement = zeros(length(joining_elements), length(joining_elements))
-    for (local_c, local_ainv_dot_b) in zip(split_c, split_ainv_dot_b)
+    for (local_c, local_ainv_dot_b) in zip(split_c, dense_ainv_dot_b)
       mul!(schur_complement, local_c, local_ainv_dot_b, -1.0, 1.0)
     end
     MPI.Reduce!(schur_complement, +, shared_MPI_comm; root=shared_comm_size-1)
@@ -347,6 +349,7 @@ function update_condensed_factorization!(cf::CondensedFactorization{T}, A::Abstr
 
       ldiv!(local_ainv_dot_b, local_aniv, local_b)
     end
+    new_ainv_dot_b = cf.split_ainv_dot_b
   end
 
   if length(cf.joining_elements) == 0
@@ -354,7 +357,7 @@ function update_condensed_factorization!(cf::CondensedFactorization{T}, A::Abstr
   elseif cf.shared_comm_rank == cf.shared_comm_size - 1
     # Last rank on the communicator does the Schur-complement solve.
     schur_complement = A[joining_elements, joining_elements]
-    for (local_c, local_ainv_dot_b) in zip(cf.split_c, cf.split_ainv_dot_b)
+    for (local_c, local_ainv_dot_b) in zip(cf.split_c, new_ainv_dot_b)
       mul!(schur_complement, local_c, local_ainv_dot_b, -1.0, 1.0)
     end
     if cf.shared_comm !== nothing
@@ -383,7 +386,7 @@ function update_condensed_factorization!(cf::CondensedFactorization{T}, A::Abstr
     # Other ranks need to add contributions to Schur-complement matrix, and pass these to
     # last rank.
     schur_complement = zeros(length(joining_elements), length(joining_elements))
-    for (local_c, local_ainv_dot_b) in zip(cf.split_c, cf.split_ainv_dot_b)
+    for (local_c, local_ainv_dot_b) in zip(cf.split_c, new_ainv_dot_b)
       mul!(schur_complement, local_c, local_ainv_dot_b, -1.0, 1.0)
     end
     MPI.Reduce!(schur_complement, +, cf.shared_comm; root=cf.shared_comm_size-1)
