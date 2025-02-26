@@ -57,24 +57,27 @@ is known, we can substitute back into the expression above for \$x\$
 """
 module MPIStaticCondensation
 
-export CondensedFactorization, static_condensed_solve, ldiv!
+export CondensedFactorization, static_condensed_solve, ldiv!,
+       update_condensed_factorization!
 
 using LinearAlgebra
 import LinearAlgebra: ldiv!
 using MPI
 using SparseArrays
 
-struct CondensedFactorization{T, M<:AbstractMatrix{T}, F1<:Factorization{T},
-                              F2<:Union{Factorization{T},Nothing},
-                              LB<:Union{Vector{Vector{Int}},Vector{UnitRange{Int}}},
-                              C<:Union{MPI.Comm,Nothing},
-                              SV<:AbstractVector,
-                              V<:Union{AbstractVector,Nothing}} <: Factorization{T}
+mutable struct CondensedFactorization{T, M<:AbstractMatrix{T}, F1<:Factorization{T},
+                                      F2<:Union{Factorization{T},Nothing},
+                                      LB<:Union{Vector{Vector{Int}},Vector{UnitRange{Int}}},
+                                      C<:Union{MPI.Comm,Nothing},
+                                      SV<:AbstractVector,
+                                      V<:Union{AbstractVector,Nothing}} <: Factorization{T}
   n::Int
   n_my_blocks::Int
+  sparse_local_blocks::Bool
   localblock_factorizations::Vector{F1}
   local_blocks::LB
   my_blocks::LB
+  joining_elements::Vector{Int}
   my_joining_elements::Vector{Int}
   joining_elements_chunk::UnitRange{Int}
   split_c::Vector{M}
@@ -226,7 +229,7 @@ function CondensedFactorization(A::AbstractMatrix{T},
 
   split_b = [A[inds, joining_elements] for inds in my_blocks]
   if sparse_local_blocks
-    split_c = [sparse(A[joining_elements, inds]) for inds in my_blocks]
+    split_c = [sparse(@view(A[joining_elements, inds])) for inds in my_blocks]
     localblock_factorizations = [lu(sparse(@view(A[inds,inds]))) for inds in my_blocks]
   else
     split_c = [A[joining_elements, inds] for inds in my_blocks]
@@ -266,17 +269,129 @@ function CondensedFactorization(A::AbstractMatrix{T},
     schur_complement_factorization = nothing
   end
 
-  return CondensedFactorization(n, n_my_blocks, localblock_factorizations, local_blocks,
-                                my_blocks, my_joining_elements, joining_elements_chunk,
-                                split_c, split_ainv_dot_b, schur_complement_factorization,
-                                split_rhs_local, split_solution_local,
-                                joining_elements_rhs,
+  return CondensedFactorization(n, n_my_blocks, sparse_local_blocks,
+                                localblock_factorizations, local_blocks, my_blocks,
+                                joining_elements, my_joining_elements,
+                                joining_elements_chunk, split_c, split_ainv_dot_b,
+                                schur_complement_factorization, split_rhs_local,
+                                split_solution_local, joining_elements_rhs,
                                 joining_elements_rhs_unshared_buffer,
                                 joining_elements_solution, shared_MPI_comm,
                                 shared_comm_size, shared_comm_rank)
 end
 Base.size(A::CondensedFactorization) = (A.n, A.n)
 Base.size(A::CondensedFactorization, i) = A.n
+
+function update_condensed_factorization!(cf::CondensedFactorization{T}, A::AbstractMatrix{T}) where T
+  n = cf.n
+  @assert size(A) == (n, n)
+
+  my_blocks = cf.my_blocks
+  joining_elements = cf.joining_elements
+  sparse_local_blocks = cf.sparse_local_blocks
+
+  @inbounds @boundscheck begin
+    # When `--check-bounds=yes`, verify that all the matrix elements that are supposed to
+    # be zero are actually zero.
+    local_blocks = cf.local_blocks
+    blocks_per_rank = length(local_blocks) ÷ cf.shared_comm_size
+    my_blocks_inds = cf.shared_comm_rank*blocks_per_rank+1:(cf.shared_comm_rank+1)*blocks_per_rank
+    for myblockx ∈ 1:length(my_blocks), iblocky ∈ 1:length(local_blocks)
+      iblockx = my_blocks_inds[myblockx]
+      if iblockx == iblocky
+        # This is a local block that should have non-zero elements
+        continue
+      end
+      this_block = A[my_blocks[myblockx], local_blocks[iblocky]]
+      if !all(this_block .== 0.0)
+        error("In block ($iblockx,$iblocky), with row indices $(my_blocks[iblockx]) and "
+              * "column indices $(local_blocks[iblocky]), found non-zero entries where "
+              * "there should not be any.")
+      end
+    end
+  end
+
+  split_b = [A[inds, joining_elements] for inds in my_blocks]
+  if sparse_local_blocks
+    cf.split_c .= [sparse(@view(A[joining_elements, inds])) for inds in my_blocks]
+    for (i, (fac,inds)) in enumerate(zip(cf.localblock_factorizations, my_blocks))
+      sparse_block = sparse(@view(A[inds,inds]))
+      try
+        lu!(fac, sparse_block; check=false)
+      catch e
+        if !isa(e, ArgumentError)
+          rethrow(e)
+        end
+        cf.localblock_factorizations[i] = lu(sparse_block)
+      end
+    end
+  else
+    for (c,inds) in zip(cf.split_c, my_blocks)
+      c .= @view A[joining_elements, inds]
+    end
+    for (i, (fac,inds)) in enumerate(zip(cf.localblock_factorizations, my_blocks))
+      # Reuse matrix already allocated in fac
+      mat = fac.factors
+      mat .= @view A[inds,inds]
+      cf.localblock_factorizations[i] = lu!(mat)
+    end
+  end
+
+  if sparse_local_blocks
+    new_ainv_dot_b = [local_aniv \ local_b for (local_aniv, local_b)
+                      in zip(cf.localblock_factorizations, split_b)]
+    cf.split_ainv_dot_b .= [sparse(local_ainv_dot_b) for local_ainv_dot_b in new_ainv_dot_b]
+  else
+    for (local_ainv_dot_b, local_aniv, local_b) in
+        zip(cf.split_ainv_dot_b, cf.localblock_factorizations, split_b)
+
+      ldiv!(local_ainv_dot_b, local_aniv, local_b)
+    end
+  end
+
+  if length(cf.joining_elements) == 0
+    # Nothing to do as Schur complement is empty
+  elseif cf.shared_comm_rank == cf.shared_comm_size - 1
+    # Last rank on the communicator does the Schur-complement solve.
+    schur_complement = A[joining_elements, joining_elements]
+    for (local_c, local_ainv_dot_b) in zip(cf.split_c, cf.split_ainv_dot_b)
+      mul!(schur_complement, local_c, local_ainv_dot_b, -1.0, 1.0)
+    end
+    if cf.shared_comm !== nothing
+      MPI.Reduce!(schur_complement, +, cf.shared_comm; root=cf.shared_comm_size-1)
+    end
+    if sparse_local_blocks
+      sparse_schur_complement = sparse(schur_complement)
+      try
+        lu!(cf.schur_complement_factorization, sparse_schur_complement)
+      catch e
+        if !isa(e, ArgumentError)
+          rethrow(e)
+        end
+        cf.schur_complement_factorization = lu(sparse_schur_complement)
+      end
+    else
+      new_factorization = lu(schur_complement)
+      cf.schur_complement_factorization.factors .= new_factorization.factors
+      cf.schur_complement_factorization.ipiv .= new_factorization.ipiv
+      if cf.schur_complement_factorization.info != new_factorization.info
+        error("New schur_complement_factorization has info=$(new_factorization.info). "
+              * "Expected same as original $(cf.schur_complement_factorization.info)")
+      end
+    end
+  else
+    # Other ranks need to add contributions to Schur-complement matrix, and pass these to
+    # last rank.
+    schur_complement = zeros(length(joining_elements), length(joining_elements))
+    for (local_c, local_ainv_dot_b) in zip(cf.split_c, cf.split_ainv_dot_b)
+      mul!(schur_complement, local_c, local_ainv_dot_b, -1.0, 1.0)
+    end
+    MPI.Reduce!(schur_complement, +, cf.shared_comm; root=cf.shared_comm_size-1)
+    schur_complement_factorization = nothing
+  end
+
+  return cf
+end
 
 function split_rhs!(A::CondensedFactorization, U::AbstractVector)
   n_my_blocks = A.n_my_blocks

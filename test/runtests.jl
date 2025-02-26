@@ -342,17 +342,7 @@ end
     end
 
     fe_tol = 1.0e-14
-    @testset "finite-element like ($nelement_x, $ngrid_x, $nelement_y, $ngrid_y) sparse=$sparse" for
-        sparse in (false, true), nelement_x in 1:6, ngrid_x in 3:6, nelement_y in 1:6, ngrid_y in 3:6
-
-      # Parallel version only works if number of ranks divides the number of local
-      # blocks.
-      if nelement_x * nelement_y % comm_size != 0
-        continue
-      end
-
-      rng = StableRNG(0)
-
+    function get_A(nelement_x, ngrid_x, nelement_y, ngrid_y, rng)
       nx = nelement_x * (ngrid_x - 1) + 1
       ny = nelement_y * (ngrid_y - 1) + 1
 
@@ -386,6 +376,23 @@ end
           end
         end
       end
+      return A
+    end
+    @testset "finite-element like ($nelement_x, $ngrid_x, $nelement_y, $ngrid_y) sparse=$sparse" for
+        sparse in (false, true), nelement_x in 1:6, ngrid_x in 3:6, nelement_y in 1:6, ngrid_y in 3:6
+
+      # Parallel version only works if number of ranks divides the number of local
+      # blocks.
+      if nelement_x * nelement_y % comm_size != 0
+        continue
+      end
+
+      rng = StableRNG(0)
+
+      nx = nelement_x * (ngrid_x - 1) + 1
+      ny = nelement_y * (ngrid_y - 1) + 1
+
+      A = get_A(nelement_x, ngrid_x, nelement_y, ngrid_y, rng)
 
       # Create one block per element
       local_blocks = Vector{Vector{Int}}()
@@ -439,6 +446,21 @@ end
                                    shared_MPI_comm=comm,
                                    joining_elements_rhs_buffer=joining_elements_rhs_buffer,
                                    joining_elements_solution_buffer=joining_elements_solution_buffer)
+      ldiv!(x, Acf, b)
+      if usempi
+        MPI.Barrier(comm)
+      end
+      if !usempi || comm_rank == 0
+        @test isapprox(A * x, b; atol=fe_tol)
+        @test isapprox(A * check, b; atol=fe_tol)
+        @test isapprox(x, check; rtol=fe_tol)
+      end
+
+      # Test updating the factorization
+      A = get_A(nelement_x, ngrid_x, nelement_y, ngrid_y, rng)
+      b .= rand(rng, size(A, 1))
+      update_condensed_factorization!(Acf, A)
+      check = A \ b
       ldiv!(x, Acf, b)
       if usempi
         MPI.Barrier(comm)
