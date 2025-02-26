@@ -61,21 +61,33 @@ export CondensedFactorization, static_condensed_solve, ldiv!
 
 using LinearAlgebra
 import LinearAlgebra: ldiv!
+using MPI
 using SparseArrays
 
 struct CondensedFactorization{T, M<:AbstractMatrix{T}, F1<:Factorization{T},
                               F2<:Union{Factorization{T},Nothing},
-                              LB<:Union{Vector{Vector{Int}},Vector{UnitRange{Int}}}} <: Factorization{T}
+                              LB<:Union{Vector{Vector{Int}},Vector{UnitRange{Int}}},
+                              C<:Union{MPI.Comm,Nothing},
+                              SV<:AbstractVector,
+                              V<:Union{AbstractVector,Nothing}} <: Factorization{T}
   n::Int
-  n_local_blocks::Int
+  n_my_blocks::Int
   localblock_factorizations::Vector{F1}
   local_blocks::LB
-  joining_elements::Vector{Int}
+  my_blocks::LB
+  my_joining_elements::Vector{Int}
+  joining_elements_chunk::UnitRange{Int}
   split_c::Vector{M}
   split_ainv_dot_b::Vector{M}
   schur_complement_factorization::F2
-  split_rhs::Vector{Vector{T}}
-  split_solution::Vector{Vector{T}}
+  split_rhs_local::Vector{Vector{T}}
+  split_solution_local::Vector{Vector{T}}
+  joining_elements_rhs::SV
+  joining_elements_rhs_unshared_buffer::V
+  joining_elements_solution::SV
+  shared_comm::C
+  shared_comm_size::Int
+  shared_comm_rank::Int
 end
 
 function CondensedFactorization(A::AbstractMatrix{T}, localblocksize::Integer, couplingblocksize::Integer; kwargs...) where T
@@ -99,31 +111,105 @@ end
 
 function CondensedFactorization(A::AbstractMatrix{T},
                                 local_blocks::Union{Vector{Vector{I}},Vector{UnitRange{I}}} where I <: Integer;
-                                sparse_local_blocks=false) where T
+                                sparse_local_blocks=false,
+                                shared_MPI_comm::Union{MPI.Comm,Nothing}=nothing,
+                                joining_elements_rhs_buffer::Union{AbstractVector,Nothing}=nothing,
+                                joining_elements_solution_buffer::Union{AbstractVector,Nothing}=nothing) where T
   n = size(A, 1)
   @assert n == size(A, 2)
+
   n_local_blocks = length(local_blocks)
+  all_indices = collect(1:n)
+  all_local_block_indices = union((inds isa UnitRange ? collect(inds) : inds for inds in local_blocks)...)
+  joining_elements = [i for i in all_indices if !(i in all_local_block_indices)]
+
+  if (joining_elements_rhs_buffer !== nothing
+      && length(joining_elements_rhs_buffer) != length(joining_elements))
+    error("The length of `joining_elements_rhs_buffer` "
+          * "($(length(joining_elements_rhs_buffer)) must be equal to the number "
+          * "of joining elements ($(length(joining_elements))")
+  end
+  if (joining_elements_solution_buffer !== nothing
+      && length(joining_elements_solution_buffer) != length(joining_elements))
+    error("The length of `joining_elements_solution_buffer` "
+          * "($(length(joining_elements_solution_buffer)) must be equal to the number "
+          * "of joining elements ($(length(joining_elements))")
+  end
+
+  if shared_MPI_comm !== nothing
+    shared_comm_size = MPI.Comm_size(shared_MPI_comm)
+    shared_comm_rank = MPI.Comm_rank(shared_MPI_comm)
+
+    if shared_comm_size > n_local_blocks
+      if shared_comm_rank < n_local_blocks
+        my_blocks = local_blocks[shared_comm_rank+1:shared_comm_rank+1]
+      else
+        my_blocks = local_blocks[1:0]
+      end
+    elseif n_local_blocks % shared_comm_size == 0
+      blocks_per_rank = n_local_blocks ÷ shared_comm_size
+      my_blocks_inds = shared_comm_rank*blocks_per_rank+1:(shared_comm_rank+1)*blocks_per_rank
+      my_blocks = local_blocks[my_blocks_inds]
+    else
+      error("Number of blocks ($n_local_blocks) must be divisible by the number of MPI "
+            * "ranks ($shared_comm_size), unless there are more MPI ranks than blocks.")
+    end
+    n_my_blocks = length(my_blocks)
+
+    if joining_elements_rhs_buffer === nothing
+      error("When using shared-memory MPI, must pass a shared-memory buffer to the "
+            * "`joining_elements_rhs_buffer` argument of `CondensedFactorization()`")
+    end
+    joining_elements_rhs = joining_elements_rhs_buffer
+
+    if joining_elements_solution_buffer === nothing
+      error("When using shared-memory MPI, must pass a shared-memory buffer to the "
+            * "`joining_elements_solution_buffer` argument of `CondensedFactorization()`")
+    end
+    joining_elements_solution = joining_elements_solution_buffer
+
+    joining_elements_chunk_size = (length(joining_elements) + shared_comm_size - 1) ÷ shared_comm_size
+    joining_elements_chunk = (shared_comm_rank * joining_elements_chunk_size + 1):min((shared_comm_rank + 1) * joining_elements_chunk_size, length(joining_elements))
+    my_joining_elements = joining_elements[joining_elements_chunk]
+    joining_elements_rhs_unshared_buffer = zeros(eltype(A), length(joining_elements_rhs))
+  else
+    shared_comm_size = 1
+    shared_comm_rank = 0
+    n_my_blocks = n_local_blocks
+    my_blocks = local_blocks
+    my_blocks_inds = 1:n_local_blocks
+    if joining_elements_rhs_buffer === nothing
+      joining_elements_rhs = similar(A, length(joining_elements))
+    else
+      joining_elements_rhs = joining_elements_rhs_buffer
+    end
+    if joining_elements_solution_buffer === nothing
+      joining_elements_solution = similar(A, length(joining_elements))
+    else
+      joining_elements_solution = joining_elements_solution_buffer
+    end
+    my_joining_elements = joining_elements
+    joining_elements_chunk = 1:length(joining_elements)
+    joining_elements_rhs_unshared_buffer = nothing
+  end
 
   @inbounds @boundscheck begin
     # When `--check-bounds=yes`, verify that all the matrix elements that are supposed to
     # be zero are actually zero.
-    for iblockx ∈ 1:n_local_blocks, iblocky ∈ 1:n_local_blocks
+    for myblockx ∈ 1:n_my_blocks, iblocky ∈ 1:n_local_blocks
+      iblockx = my_blocks_inds[myblockx]
       if iblockx == iblocky
         # This is a local block that should have non-zero elements
         continue
       end
-      this_block = A[local_blocks[iblockx], local_blocks[iblocky]]
+      this_block = A[my_blocks[myblockx], local_blocks[iblocky]]
       if !all(this_block .== 0.0)
-        error("In block ($iblockx,$iblocky), with row indices $(local_blocks[iblockx]) and "
+        error("In block ($iblockx,$iblocky), with row indices $(my_blocks[iblockx]) and "
               * "column indices $(local_blocks[iblocky]), found non-zero entries where "
               * "there should not be any.")
       end
     end
   end
-
-  all_indices = collect(1:n)
-  all_local_block_indices = union((inds isa UnitRange ? collect(inds) : inds for inds in local_blocks)...)
-  joining_elements = [i for i in all_indices if !(i in all_local_block_indices)]
 
   # Check indices were unique, so all indices are now in either local_blocks or
   # joining_elements but not both.
@@ -134,18 +220,17 @@ function CondensedFactorization(A::AbstractMatrix{T},
     error("Total number of indices not equal to the size of A")
   end
 
-  all_block_sizes = [length(inds) for inds in local_blocks]
-  push!(all_block_sizes, length(joining_elements))
-  split_rhs = [similar(A, nblock) for nblock ∈ all_block_sizes]
-  split_solution = [similar(A, nblock) for nblock ∈ all_block_sizes]
+  all_block_sizes = [length(inds) for inds in my_blocks]
+  split_rhs_local = [similar(A, nblock) for nblock ∈ all_block_sizes]
+  split_solution_local = [similar(A, nblock) for nblock ∈ all_block_sizes]
 
-  split_b = [A[inds, joining_elements] for inds in local_blocks]
+  split_b = [A[inds, joining_elements] for inds in my_blocks]
   if sparse_local_blocks
-    split_c = [sparse(A[joining_elements, inds]) for inds in local_blocks]
-    localblock_factorizations = [lu(sparse(@view(A[inds,inds]))) for inds in local_blocks]
+    split_c = [sparse(A[joining_elements, inds]) for inds in my_blocks]
+    localblock_factorizations = [lu(sparse(@view(A[inds,inds]))) for inds in my_blocks]
   else
-    split_c = [A[joining_elements, inds] for inds in local_blocks]
-    localblock_factorizations = [lu(@view(A[inds,inds])) for inds in local_blocks]
+    split_c = [A[joining_elements, inds] for inds in my_blocks]
+    localblock_factorizations = [lu(@view(A[inds,inds])) for inds in my_blocks]
   end
 
   split_ainv_dot_b = [local_aniv \ local_b for (local_aniv, local_b)
@@ -154,99 +239,165 @@ function CondensedFactorization(A::AbstractMatrix{T},
     split_ainv_dot_b = [sparse(local_ainv_dot_b) for local_ainv_dot_b in split_ainv_dot_b]
   end
 
-  schur_complement = A[joining_elements, joining_elements]
-  for (local_c, local_ainv_dot_b) in zip(split_c, split_ainv_dot_b)
-    mul!(schur_complement, local_c, local_ainv_dot_b, -1.0, 1.0)
-  end
-  if size(schur_complement) == (0, 0)
+  if shared_comm_rank == shared_comm_size - 1
+    # Last rank on the communicator does the Schur-complement solve.
+    schur_complement = A[joining_elements, joining_elements]
+    for (local_c, local_ainv_dot_b) in zip(split_c, split_ainv_dot_b)
+      mul!(schur_complement, local_c, local_ainv_dot_b, -1.0, 1.0)
+    end
+    if shared_MPI_comm !== nothing
+        MPI.Reduce!(schur_complement, +, shared_MPI_comm; root=shared_comm_size-1)
+    end
+    if size(schur_complement) == (0, 0)
       schur_complement_factorization = nothing
-  elseif sparse_local_blocks
-    schur_complement_factorization = lu(sparse(schur_complement))
+    elseif sparse_local_blocks
+      schur_complement_factorization = lu(sparse(schur_complement))
+    else
+      schur_complement_factorization = lu(schur_complement)
+    end
   else
-    schur_complement_factorization = lu(schur_complement)
+    # Other ranks need to add contributions to Schur-complement matrix, and pass these to
+    # last rank.
+    schur_complement = zeros(length(joining_elements), length(joining_elements))
+    for (local_c, local_ainv_dot_b) in zip(split_c, split_ainv_dot_b)
+      mul!(schur_complement, local_c, local_ainv_dot_b, -1.0, 1.0)
+    end
+    MPI.Reduce!(schur_complement, +, shared_MPI_comm; root=shared_comm_size-1)
+    schur_complement_factorization = nothing
   end
 
-  return CondensedFactorization(n, n_local_blocks, localblock_factorizations, local_blocks,
-                                joining_elements, split_c, split_ainv_dot_b,
-                                schur_complement_factorization, split_rhs, split_solution)
+  return CondensedFactorization(n, n_my_blocks, localblock_factorizations, local_blocks,
+                                my_blocks, my_joining_elements, joining_elements_chunk,
+                                split_c, split_ainv_dot_b, schur_complement_factorization,
+                                split_rhs_local, split_solution_local,
+                                joining_elements_rhs,
+                                joining_elements_rhs_unshared_buffer,
+                                joining_elements_solution, shared_MPI_comm,
+                                shared_comm_size, shared_comm_rank)
 end
 Base.size(A::CondensedFactorization) = (A.n, A.n)
 Base.size(A::CondensedFactorization, i) = A.n
 
 function split_rhs!(A::CondensedFactorization, U::AbstractVector)
-  n_local_blocks = A.n_local_blocks
-  local_blocks = A.local_blocks
-  joining_elements = A.joining_elements
-  split_rhs = A.split_rhs
+  n_my_blocks = A.n_my_blocks
+  my_blocks = A.my_blocks
+  my_joining_elements = A.my_joining_elements
+  split_rhs_local = A.split_rhs_local
+  joining_elements_rhs = A.joining_elements_rhs
+  joining_elements_chunk = A.joining_elements_chunk
 
-  for iblock in 1:n_local_blocks
-    split_rhs[iblock] .= @view U[local_blocks[iblock]]
+  for iblock in 1:n_my_blocks
+    split_rhs_local[iblock] .= @view U[my_blocks[iblock]]
   end
 
-  split_rhs[end] .= @view U[joining_elements]
+  joining_elements_rhs[joining_elements_chunk] .= @view U[my_joining_elements]
 
   return nothing
 end
 
 function localblocks_solve!(A)
-  split_rhs = A.split_rhs
-  split_solution = A.split_solution
+  split_rhs_local = A.split_rhs_local
+  split_solution_local = A.split_solution_local
 
-  n_local_blocks = A.n_local_blocks
+  n_my_blocks = A.n_my_blocks
   localblock_factorizations = A.localblock_factorizations
 
-  for iblock in 1:n_local_blocks
-    ldiv!(split_solution[iblock], localblock_factorizations[iblock], split_rhs[iblock])
+  for iblock in 1:n_my_blocks
+    ldiv!(split_solution_local[iblock], localblock_factorizations[iblock],
+          split_rhs_local[iblock])
   end
 
   return nothing
 end
 
 function schur_complement_solve!(A)
-  schur_complement_factorization = A.schur_complement_factorization
-  if schur_complement_factorization === nothing
-      # Schur complement is size-(0,0), so nothing to do.
+  joining_elements_solution = A.joining_elements_solution
+  if length(joining_elements_solution) == 0
+      # No joining elements, so nothing to do.
       return nothing
   end
-  n_local_blocks = A.n_local_blocks
-  split_solution = A.split_solution
+  n_my_blocks = A.n_my_blocks
+  split_solution_local = A.split_solution_local
   split_c = A.split_c
-  joining_elements_solution = split_solution[end]
-  joining_elements_rhs = A.split_rhs[end]
+  joining_elements_rhs = A.joining_elements_rhs
+  schur_complement_factorization = A.schur_complement_factorization
+  shared_comm = A.shared_comm
+  shared_comm_rank = A.shared_comm_rank
+  shared_comm_size = A.shared_comm_size
 
-  for iblock in 1:n_local_blocks
-    mul!(joining_elements_rhs, split_c[iblock], split_solution[iblock], -1.0, 1.0)
+  # Add MPI.Barrier() calls to ensure joining_elements_rhs is modified sequentially by
+  # each rank.
+  if shared_comm === nothing
+    for iblock in 1:n_my_blocks
+      mul!(joining_elements_rhs, split_c[iblock], split_solution_local[iblock], -1.0, 1.0)
+    end
+  else
+    joining_elements_rhs_unshared_buffer = A.joining_elements_rhs_unshared_buffer
+    if shared_comm_rank == 0
+      for iblock in 1:n_my_blocks
+        mul!(joining_elements_rhs, split_c[iblock],
+             split_solution_local[iblock], -1.0, 1.0)
+      end
+    else
+      if n_my_blocks > 0
+        mul!(joining_elements_rhs_unshared_buffer, split_c[1],
+             split_solution_local[1])
+      end
+      for iblock in 2:n_my_blocks
+        mul!(joining_elements_rhs_unshared_buffer, split_c[iblock],
+             split_solution_local[iblock], 1.0, 1.0)
+      end
+      for r ∈ 1:shared_comm_rank
+        MPI.Barrier(shared_comm)
+      end
+      joining_elements_rhs .-= joining_elements_rhs_unshared_buffer
+    end
+    for r ∈ shared_comm_rank+1:shared_comm_size - 1
+      MPI.Barrier(shared_comm)
+    end
   end
 
-  ldiv!(joining_elements_solution, schur_complement_factorization, joining_elements_rhs)
+  # Last rank was the last one to modify joining_element_rhs, so if it does the ldiv!()
+  # then we do not need an extra MPI.Barrier first
+  if shared_comm_rank == shared_comm_size - 1
+    ldiv!(joining_elements_solution, schur_complement_factorization, joining_elements_rhs)
+  end
+
+  if shared_comm !== nothing
+    # Need to ensure ldiv!() is finished before we start x_backsubstitution!()
+    MPI.Barrier(shared_comm)
+  end
 
   return nothing
 end
 
 function x_backsubstitution!(A)
-  n_local_blocks = A.n_local_blocks
-  split_solution = A.split_solution
-  joining_elements_solution = split_solution[end]
+  n_my_blocks = A.n_my_blocks
+  split_solution_local = A.split_solution_local
+  joining_elements_solution = A.joining_elements_solution
   split_ainv_dot_b = A.split_ainv_dot_b
 
-  for iblock in 1:n_local_blocks
-    mul!(split_solution[iblock], split_ainv_dot_b[iblock], joining_elements_solution, -1.0, 1.0)
+  for iblock in 1:n_my_blocks
+    mul!(split_solution_local[iblock], split_ainv_dot_b[iblock],
+         joining_elements_solution, -1.0, 1.0)
   end
 
   return nothing
 end
 
 function gather_split_solution!(X, A)
-  n_local_blocks = A.n_local_blocks
-  local_blocks = A.local_blocks
-  split_solution = A.split_solution
-  joining_elements = A.joining_elements
+  n_my_blocks = A.n_my_blocks
+  my_blocks = A.my_blocks
+  split_solution_local = A.split_solution_local
+  my_joining_elements = A.my_joining_elements
+  joining_elements_solution = A.joining_elements_solution
+  joining_elements_chunk = A.joining_elements_chunk
 
-  for iblock in 1:n_local_blocks
-    X[local_blocks[iblock]] .= split_solution[iblock]
+  for iblock in 1:n_my_blocks
+    X[my_blocks[iblock]] .= split_solution_local[iblock]
   end
 
-  X[joining_elements] .= split_solution[end]
+  X[my_joining_elements] .= @view joining_elements_solution[joining_elements_chunk]
 
   return nothing
 end
@@ -256,6 +407,10 @@ function ldiv!(X::AbstractVector, A::CondensedFactorization, U::AbstractVector)
 
   # Compute a^{-1}.u
   localblocks_solve!(A)
+
+  if A.shared_comm !== nothing
+    MPI.Barrier(A.shared_comm)
+  end
 
   # Compute y
   schur_complement_solve!(A)
