@@ -293,18 +293,12 @@ end
 Base.size(A::CondensedFactorization) = (A.n, A.n)
 Base.size(A::CondensedFactorization, i) = A.n
 
-function update_condensed_factorization!(cf::CondensedFactorization{T}, A::AbstractMatrix{T}) where T
-  n = cf.n
-  @assert size(A) == (n, n)
-
-  my_blocks = cf.my_blocks
-  joining_elements = cf.joining_elements
-  sparse_local_blocks = cf.sparse_local_blocks
-
-  @inbounds @boundscheck begin
+@inline function _check_array_zeros(cf, A)
+  @boundscheck begin
     # When `--check-bounds=yes`, verify that all the matrix elements that are supposed to
     # be zero are actually zero.
     local_blocks = cf.local_blocks
+    my_blocks = cf.my_blocks
     blocks_per_rank = length(local_blocks) ÷ cf.shared_comm_size
     my_blocks_inds = cf.shared_comm_rank*blocks_per_rank+1:(cf.shared_comm_rank+1)*blocks_per_rank
     for myblockx ∈ 1:length(my_blocks), iblocky ∈ 1:length(local_blocks)
@@ -321,6 +315,18 @@ function update_condensed_factorization!(cf::CondensedFactorization{T}, A::Abstr
       end
     end
   end
+  return nothing
+end
+
+function update_condensed_factorization!(cf::CondensedFactorization{T}, A::AbstractMatrix{T}) where T
+  n = cf.n
+  @assert size(A) == (n, n)
+
+  my_blocks = cf.my_blocks
+  joining_elements = cf.joining_elements
+  sparse_local_blocks = cf.sparse_local_blocks
+
+  @inbounds _check_array_zeros(cf, A)
 
   split_b = [A[inds, joining_elements] for inds in my_blocks]
   if sparse_local_blocks
