@@ -129,14 +129,14 @@ function CondensedFactorization(A::AbstractMatrix{T},
   if (joining_elements_rhs_buffer !== nothing
       && length(joining_elements_rhs_buffer) != length(joining_elements))
     error("The length of `joining_elements_rhs_buffer` "
-          * "($(length(joining_elements_rhs_buffer)) must be equal to the number "
-          * "of joining elements ($(length(joining_elements))")
+          * "($(length(joining_elements_rhs_buffer))) must be equal to the number "
+          * "of joining elements ($(length(joining_elements)))")
   end
   if (joining_elements_solution_buffer !== nothing
       && length(joining_elements_solution_buffer) != length(joining_elements))
     error("The length of `joining_elements_solution_buffer` "
-          * "($(length(joining_elements_solution_buffer)) must be equal to the number "
-          * "of joining elements ($(length(joining_elements))")
+          * "($(length(joining_elements_solution_buffer))) must be equal to the number "
+          * "of joining elements ($(length(joining_elements)))")
   end
 
   if shared_MPI_comm !== nothing
